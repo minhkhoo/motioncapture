@@ -1,3 +1,4 @@
+import sys
 import asyncio
 import struct
 import csv
@@ -38,7 +39,7 @@ class IMUClient:
     async def start(self):
         # Scan for BLE devices
         print("Scanning for BLE devices...")
-        devices = await BleakScanner.discover()
+        devices = await BleakScanner.discover(timeout=10.0)
         
         device = None
         
@@ -60,13 +61,38 @@ class IMUClient:
             print(f"Device '{DEVICE_NAME}' not found!")
             return
         
-        print(f"Connecting to {device.name} ({device.address})...")
-        self.client = BleakClient(device)
-        await self.client.connect()
+        print(f"Connecting to {device.name} ({device.address})...", flush=True)
+        if sys.platform == "win32":
+            self.client = BleakClient(device, timeout=20.0)
+        else:
+            self.client = BleakClient(device.address, timeout=20.0)
+
+        print("Waiting for BLE connection...", flush=True)
+        await asyncio.sleep(0.5)
+
+        try:
+            print("Starting client.connect()", flush=True)
+            await asyncio.wait_for(self.client.connect(), timeout=20.0)
+            print("client.connect() returned", flush=True)
+        except asyncio.TimeoutError:
+            print("Connection timed out after 20 seconds", flush=True)
+            return
+        except Exception as e:
+            print(f"Connection failed: {type(e).__name__}: {e}", flush=True)
+            return
+
+        if not self.client.is_connected:
+            print("Failed to connect to IMU")
+            return
 
         print("IMU connected")
 
-        await self.client.start_notify(IMU_UUID, self.handler)
+        try:
+            await self.client.start_notify(IMU_UUID, self.handler)
+        except Exception as e:
+            print(f"Failed to start notifications: {type(e).__name__}: {e}")
+            await self.client.disconnect()
+            return
 
     async def send_start(self):
         self.collecting = True
