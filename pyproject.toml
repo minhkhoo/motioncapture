@@ -5,6 +5,6 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = "==3.10"
 dependencies = [
-    "bleak>=3.0.1",
+    "bleak===0.22.3",
     "mediapipe===0.10.9",
 ]

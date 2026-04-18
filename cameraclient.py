@@ -10,25 +10,43 @@ class CameraClient:
 
         self.cap = cv2.VideoCapture(0)
 
-        self.file = open("camera_data.csv", "w", newline="")
-        self.writer = csv.writer(self.file)
+        self._lock = threading.Lock()
+        self.file = None
+        self.writer = None
 
-        self.writer.writerow([
-            "frame","timestamp",
-            "shoulder_x","shoulder_y","shoulder_z","shoulder_visibility",
-            "elbow_x","elbow_y","elbow_z","elbow_visibility",
-            "wrist_x","wrist_y","wrist_z","wrist_visibility"
-        ])
-
-    
         self.mp_pose = mp.solutions.pose
         self.pose = self.mp_pose.Pose()
 
         self.frame = 0
 
-        # 🔥 QUAN TRỌNG
         self.collect_event = threading.Event()
         self.stop_event = threading.Event()
+
+    # =======================
+    # SESSION
+    # =======================
+
+    def open_session(self, session_dir):
+        with self._lock:
+            if self.file:
+                self.file.close()
+            self.file = open(session_dir / "camera_data.csv", "w", newline="")
+            self.writer = csv.writer(self.file)
+            self.writer.writerow([
+                "frame","timestamp",
+                "shoulder_x","shoulder_y","shoulder_z","shoulder_visibility",
+                "elbow_x","elbow_y","elbow_z","elbow_visibility",
+                "wrist_x","wrist_y","wrist_z","wrist_visibility"
+            ])
+            self.frame = 0
+
+    def close_session(self):
+        with self._lock:
+            if self.file:
+                self.file.flush()
+                self.file.close()
+                self.file = None
+                self.writer = None
 
     # =======================
     # CONTROL
@@ -41,9 +59,11 @@ class CameraClient:
     def stop(self):
         print("Camera STOP")
         self.collect_event.clear()
+        self.close_session()
 
     def shutdown(self):
         print("Camera SHUTDOWN")
+        self.collect_event.clear()
         self.stop_event.set()
 
     # =======================
@@ -73,14 +93,15 @@ class CameraClient:
                     e = lm[self.mp_pose.PoseLandmark.RIGHT_ELBOW]
                     w = lm[self.mp_pose.PoseLandmark.RIGHT_WRIST]
 
-                    self.writer.writerow([
-                        self.frame, now,
-                        s.x, s.y, s.z, s.visibility,
-                        e.x, e.y, e.z, e.visibility,
-                        w.x, w.y, w.z, w.visibility
-                    ])
-
-                    self.frame += 1
+                    with self._lock:
+                        if self.writer is not None:
+                            self.writer.writerow([
+                                self.frame, now,
+                                s.x, s.y, s.z, s.visibility,
+                                e.x, e.y, e.z, e.visibility,
+                                w.x, w.y, w.z, w.visibility
+                            ])
+                            self.frame += 1
 
             cv2.imshow("Camera", frame)
 
@@ -89,5 +110,5 @@ class CameraClient:
 
         # cleanup
         self.cap.release()
-        self.file.close()
+        self.close_session()
         cv2.destroyAllWindows()
