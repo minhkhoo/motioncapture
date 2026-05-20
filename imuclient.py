@@ -4,7 +4,7 @@ import struct
 import csv
 import time
 import threading
-
+from shareddata import shared_data
 DEVICE_NAME = "Nano33BLE"
 ADDRESS = "FB:5E:F5:A6:04:CB"  # Fallback address
 
@@ -68,12 +68,48 @@ class IMUClient:
     # ------------------------------------------------------------------
 
     def handler(self, sender, data):
-        if not self.collecting or self.writer is None:
+
+        if not self.collecting:
             return
+
         pc_time = time.perf_counter()
+
         timestamp, ax, ay, az, gx, gy, gz = struct.unpack("I6f", data)
-        self.writer.writerow([pc_time, timestamp,
-                               ax, ay, az, gx, gy, gz])
+
+        # =========================
+        # WRITE CSV
+        # =========================
+
+        if self.writer is not None:
+
+            self.writer.writerow([
+
+                pc_time,
+                timestamp,
+
+                ax, ay, az,
+
+                gx, gy, gz
+            ])
+
+        # =========================
+        # LIVE SHARED DATA
+        # =========================
+
+        shared_data.imu_buffer.append({
+
+            "timestamp": pc_time,
+
+            # TEMP:
+            # using accelerometer xyz
+            # as wrist xyz
+
+            "wrist": (
+                ax,
+                ay,
+                az
+            )
+        })
 
     # ------------------------------------------------------------------
     # BLE coroutines (run on the BLE thread)

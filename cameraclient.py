@@ -4,6 +4,9 @@ import csv
 import time
 import threading
 
+from shareddata import shared_data
+
+
 class CameraClient:
 
     def __init__(self):
@@ -11,6 +14,7 @@ class CameraClient:
         self.cap = cv2.VideoCapture(0)
 
         self._lock = threading.Lock()
+
         self.file = None
         self.writer = None
 
@@ -27,24 +31,42 @@ class CameraClient:
     # =======================
 
     def open_session(self, session_dir):
+
         with self._lock:
+
             if self.file:
                 self.file.close()
-            self.file = open(session_dir / "camera_data.csv", "w", newline="")
+
+            self.file = open(
+                session_dir / "camera_data.csv",
+                "w",
+                newline=""
+            )
+
             self.writer = csv.writer(self.file)
+
+            # HEADER ONLY
             self.writer.writerow([
-                "frame","timestamp",
-                "shoulder_x","shoulder_y","shoulder_z","shoulder_visibility",
-                "elbow_x","elbow_y","elbow_z","elbow_visibility",
-                "wrist_x","wrist_y","wrist_z","wrist_visibility"
+                "frame", "timestamp",
+
+                "shoulder_x", "shoulder_y", "shoulder_z", "shoulder_visibility",
+
+                "elbow_x", "elbow_y", "elbow_z", "elbow_visibility",
+
+                "wrist_x", "wrist_y", "wrist_z", "wrist_visibility"
             ])
+
             self.frame = 0
 
     def close_session(self):
+
         with self._lock:
+
             if self.file:
+
                 self.file.flush()
                 self.file.close()
+
                 self.file = None
                 self.writer = None
 
@@ -53,17 +75,25 @@ class CameraClient:
     # =======================
 
     def start(self):
+
         print("Camera START")
+
         self.collect_event.set()
 
     def stop(self):
+
         print("Camera STOP")
+
         self.collect_event.clear()
+
         self.close_session()
 
     def shutdown(self):
+
         print("Camera SHUTDOWN")
+
         self.collect_event.clear()
+
         self.stop_event.set()
 
     # =======================
@@ -75,6 +105,7 @@ class CameraClient:
         while not self.stop_event.is_set():
 
             ret, frame = self.cap.read()
+
             if not ret:
                 continue
 
@@ -83,6 +114,7 @@ class CameraClient:
                 now = time.perf_counter()
 
                 image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
                 results = self.pose.process(image)
 
                 if results.pose_landmarks:
@@ -90,25 +122,68 @@ class CameraClient:
                     lm = results.pose_landmarks.landmark
 
                     s = lm[self.mp_pose.PoseLandmark.RIGHT_SHOULDER]
+
                     e = lm[self.mp_pose.PoseLandmark.RIGHT_ELBOW]
+
                     w = lm[self.mp_pose.PoseLandmark.RIGHT_WRIST]
 
                     with self._lock:
+
                         if self.writer is not None:
+
+                            # =========================
+                            # WRITE CSV
+                            # =========================
+
                             self.writer.writerow([
-                                self.frame, now,
+
+                                self.frame,
+                                now,
+
                                 s.x, s.y, s.z, s.visibility,
+
                                 e.x, e.y, e.z, e.visibility,
+
                                 w.x, w.y, w.z, w.visibility
                             ])
+
+                            # =========================
+                            # LIVE SHARED DATA
+                            # =========================
+
+                            shared_data.camera_buffer.append({
+
+                                "timestamp": now,
+
+                                "shoulder": (
+                                    s.x,
+                                    s.y,
+                                    s.z
+                                ),
+
+                                "elbow": (
+                                    e.x,
+                                    e.y,
+                                    e.z
+                                ),
+
+                                "wrist": (
+                                    w.x,
+                                    w.y,
+                                    w.z
+                                )
+                            })
+
                             self.frame += 1
 
             cv2.imshow("Camera", frame)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
+
                 self.shutdown()
 
         # cleanup
+
         self.cap.release()
         self.close_session()
         cv2.destroyAllWindows()
