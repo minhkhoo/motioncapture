@@ -30,6 +30,7 @@ wheels/
 
 # Data files (CSV outputs)
 *.csv
+*.mp4
 
 # IDE
 .vscode/

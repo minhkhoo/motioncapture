@@ -7,4 +7,6 @@ requires-python = "==3.10"
 dependencies = [
     "bleak===0.22.3",
     "mediapipe===0.10.9",
+    "pandas>=2.3.3",
+    "pyqt6>=6.11.0",
 ]
