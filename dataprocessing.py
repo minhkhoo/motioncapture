@@ -2,311 +2,229 @@ import matplotlib
 matplotlib.use("TkAgg")
 
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-from matplotlib.animation import FFMpegWriter
-from mpl_toolkits.mplot3d import Axes3D
-
-from matplotlib.figure import Figure 
-from matplotlib.backends.backend_agg import FigureCanvasAgg
-from matplotlib.widgets import Slider, Button  
-
+from matplotlib.widgets import Slider, Button 
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
 import numpy as np
 import pandas as pd
 from pathlib import Path
 import sys
 
-from shareddata import shared_data
+# =====================================================================
+# CAU HINH BO LOC DONG HOC (EMA Filter)
+# =====================================================================
+TRAIL_LENGTH = 45  # Do dai duong quy dao cua co tay
 
-# =========================
-# CONFIG
-# =========================
-TRAIL_LENGTH = 30
+# Bo loc lam muot chong nhieu toa do tu MediaPipe
+SMOOTH_SH = 0.85  
+SMOOTH_EL = 0.50  
+SMOOTH_WR = 0.30  
 
-# Tách riêng hệ số lọc cho từng khớp dựa trên tốc độ chuyển động thực tế
-SMOOTH_SH = 0.85  # Vai di chuyển chậm 
-SMOOTH_EL = 0.45  # Khuỷu tay di chuyển vừa 
-SMOOTH_WR = 0.15  # Cổ tay vung cực nhanh 
-
-# =========================
-# GLOBALS (Filters added for all 3 joints)
-# =========================
-smooth_shoulder = None
-smooth_elbow = None
-smooth_wrist = None
-wrist_trail = []
-
-# =========================
-# GET LATEST CAMERA POSE
-# =========================
-def get_pose():
-    if not shared_data.camera_buffer:
-        return None
-    return shared_data.camera_buffer[-1]
-
+def calculate_elbow_angle(shoulder, elbow, wrist):
+    """Tinh goc gap khuyl tay trong khong gian 3D (0 - 180 do)"""
+    v1 = np.array(elbow) - np.array(shoulder)
+    v2 = np.array(wrist) - np.array(elbow)
+    cosine_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
+    angle = np.degrees(np.arccos(np.clip(cosine_angle, -1.0, 1.0)))
+    return 180 - angle 
 
 # =====================================================================
-# CHỨC NĂNG 1: live graph 
-# =====================================================================
-def live_graph():
-    global smooth_shoulder, smooth_elbow, smooth_wrist
-    global wrist_trail
-
-    plt.ion()
-    fig = plt.figure(figsize=(8, 8))
-    ax = fig.add_subplot(111, projection='3d')
-
-    while (
-    plt.fignum_exists(fig.number)
-    and shared_data.program_running
-    ):
-        # =========================
-        # WAIT UNTIL RECORDING
-        # =========================
-        if not shared_data.graph_running:
-            plt.pause(0.1)
-            continue
-
-        pose = get_pose()
-
-        if pose is not None:
-            shoulder = np.array(pose["shoulder"])
-            elbow = np.array(pose["elbow"])
-            wrist = np.array(pose["wrist"])
-
-            # =========================
-            # NOISE FILTER WITH SPLIT COEFFICIENTS
-            # =========================
-            if smooth_shoulder is None:
-                smooth_shoulder = shoulder.copy()
-                smooth_elbow = elbow.copy()
-                smooth_wrist = wrist.copy()
-
-            smooth_shoulder = SMOOTH_SH * smooth_shoulder + (1 - SMOOTH_SH) * shoulder
-            smooth_elbow = SMOOTH_EL * smooth_elbow + (1 - SMOOTH_EL) * elbow
-            smooth_wrist = SMOOTH_WR * smooth_wrist + (1 - SMOOTH_WR) * wrist
-
-            # =========================
-            # COORDINATE TRANSFORMATION
-            # =========================
-            sh_x, sh_y, sh_z = smooth_shoulder[0], -smooth_shoulder[1], -smooth_shoulder[2]
-            el_x, el_y, el_z = smooth_elbow[0], -smooth_elbow[1], -smooth_elbow[2]
-            wr_x, wr_y, wr_z = smooth_wrist[0], -smooth_wrist[1], -smooth_wrist[2]
-
-            # =========================
-            # RELATIVE COORDINATES (Shoulder locked at 0,0,0)
-            # =========================
-            shoulder_rel = np.array([0.0, 0.0, 0.0])
-            elbow_rel = np.array([el_x - sh_x, el_y - sh_y, el_z - sh_z])
-            wrist_rel = np.array([wr_x - sh_x, wr_y - sh_y, wr_z - sh_z])
-
-            # Save wrist trajectory trail
-            wrist_trail.append(wrist_rel.copy())
-            if len(wrist_trail) > TRAIL_LENGTH:
-                wrist_trail.pop(0)
-
-            # =========================
-            # RENDER ARM
-            # =========================
-            ax.clear()
-            xs = [shoulder_rel[0], elbow_rel[0], wrist_rel[0]]
-            ys = [shoulder_rel[1], elbow_rel[1], wrist_rel[1]]
-            zs = [shoulder_rel[2], elbow_rel[2], wrist_rel[2]]
-
-            ax.scatter(xs, ys, zs, s=120, c=['red', 'green', 'blue'])
-            ax.plot(xs, ys, zs, linewidth=4, color='black')
-
-            # =========================
-            # RENDER WRIST TRAIL
-            # =========================
-            if len(wrist_trail) > 1:
-                tx = [p[0] for p in wrist_trail]
-                ty = [p[1] for p in wrist_trail]
-                tz = [p[2] for p in wrist_trail]
-                ax.plot(tx, ty, tz, alpha=0.6, linewidth=2, color='magenta', linestyle='--')
-
-            # =========================
-            # VIEW LIMITS & CONFIG
-            # =========================
-            ax.set_xlim(-0.6, 0.6)
-            ax.set_ylim(-0.6, 0.6)
-            ax.set_zlim(-0.6, 0.6)
-            ax.set_box_aspect([1, 1, 1])
-
-            ax.set_xlabel("X (Left - Right)")
-            ax.set_ylabel("Y (Down - Up)")
-            ax.set_zlabel("Z (Far - Near)")
-
-            ax.view_init(elev=0, azim=-90)
-
-            fig.canvas.draw()
-            fig.canvas.flush_events()
-
-        plt.pause(0.01)
-
-    plt.ioff()
-    plt.close(fig)
-
-
-# =====================================================================
-# CHỨC NĂNG 2: interactive replay 
+# DO THI TUONG TAC CAO CAP PHUC VU NGHIEN CUU (INTERACTIVE GRAPH)
 # =====================================================================
 def interactive_replay(session_folder):
     csv_path = Path(session_folder) / "camera_data.csv"
+    imu_path = Path(session_folder) / "imu_data.csv"
+    
     if not csv_path.exists():
-        print(f"Khong tim thay file du lieu camera_data.csv tai: {csv_path}")
+        print(f"Khong tim thay file du lieu AI tai: {csv_path}")
         return
-
-    print(f"Dang doc va phan tich du lieu tu: {session_folder}...")
-    history = pd.read_csv(csv_path)
-
-    if history.empty:
-        print("File dữ liệu CSV rỗng.")
-        return
-
-    # 1. Tính toán trước (Pre-computation) toàn bộ tọa độ
-    sh_x_s, sh_y_s, sh_z_s = None, None, None
-    el_x_s, el_y_s, el_z_s = None, None, None
-    wr_x_s, wr_y_s, wr_z_s = None, None, None
-
-    el_rels, wr_rels, trails = [], [], []
-    current_trail = []
-    
-    max_frames = len(history)
-
-    for frame in range(max_frames):
-        row = history.iloc[frame]
         
-        raw_sh_x, raw_sh_y, raw_sh_z = row["shoulder_x"], -row["shoulder_y"], -row["shoulder_z"]
-        raw_el_x, raw_el_y, raw_el_z = row["elbow_x"], -row["elbow_y"], -row["elbow_z"]
-        raw_wr_x, raw_wr_y, raw_wr_z = row["wrist_x"], -row["wrist_y"], -row["wrist_z"]
+    # 1. DOC DU LIEU CAMERA HAU KY
+    df_cam = pd.read_csv(csv_path)
+    cam_timestamps = df_cam['timestamp'].values
+    frames = df_cam['frame'].values
+    min_frame = int(frames.min())
+    max_frame = int(frames.max())
 
-        if sh_x_s is None:
-            sh_x_s, sh_y_s, sh_z_s = raw_sh_x, raw_sh_y, raw_sh_z
-            el_x_s, el_y_s, el_z_s = raw_el_x, raw_el_y, raw_el_z
-            wr_x_s, wr_y_s, wr_z_s = raw_wr_x, raw_wr_y, raw_wr_z
+    # 2. XU LY & DONG BO DATA FUSION VOI CAM BIEN IMU (NOI SUY LUONG THOI GIAN)
+    accel_mag_synced = np.zeros(len(df_cam))
+    if imu_path.exists():
+        print("Dang tien hanh Data Fusion: Noi suy dong bo IMU va Camera...")
+        df_imu = pd.read_csv(imu_path)
+        
+        imu_mag = np.sqrt(df_imu['ax']**2 + df_imu['ay']**2 + df_imu['az']**2)
+        imu_mag_clean = np.abs(imu_mag - np.mean(imu_mag.iloc[:15]))
+        
+        if 'timestamp' in df_imu.columns:
+            accel_mag_synced = np.interp(cam_timestamps, df_imu['timestamp'].values, imu_mag_clean)
+        else:
+            imu_indices = np.linspace(0, len(df_cam)-1, len(df_imu))
+            accel_mag_synced = np.interp(np.arange(len(df_cam)), imu_indices, imu_mag_clean)
+    else:
+        print("Khong tim thay file imu_data.csv. Do thi chi hien thi goc xuong tay.")
 
-        sh_x_s = SMOOTH_SH * sh_x_s + (1 - SMOOTH_SH) * raw_sh_x
-        sh_y_s = SMOOTH_SH * sh_y_s + (1 - SMOOTH_SH) * raw_sh_y
-        sh_z_s = SMOOTH_SH * sh_z_s + (1 - SMOOTH_SH) * raw_sh_z
-
-        el_x_s = SMOOTH_EL * el_x_s + (1 - SMOOTH_EL) * raw_el_x
-        el_y_s = SMOOTH_EL * el_y_s + (1 - SMOOTH_EL) * raw_el_y
-        el_z_s = SMOOTH_EL * el_z_s + (1 - SMOOTH_EL) * raw_el_z
-
-        wr_x_s = SMOOTH_WR * wr_x_s + (1 - SMOOTH_WR) * raw_wr_x
-        wr_y_s = SMOOTH_WR * wr_y_s + (1 - SMOOTH_WR) * raw_wr_y
-        wr_z_s = SMOOTH_WR * wr_z_s + (1 - SMOOTH_WR) * raw_wr_z
-
-        el_rel = [el_x_s - sh_x_s, el_y_s - sh_y_s, el_z_s - sh_z_s]
-        wr_rel = [wr_x_s - sh_x_s, wr_y_s - sh_y_s, wr_z_s - sh_z_s]
-
-        el_rels.append(el_rel)
-        wr_rels.append(wr_rel)
-
-        current_trail.append(wr_rel)
-        if len(current_trail) > TRAIL_LENGTH:
-            current_trail.pop(0)
-        trails.append(list(current_trail))
-
-    # 2. Khởi tạo giao diện tương tác Matplotlib
-    fig = plt.figure(figsize=(9, 9))
-    ax = fig.add_subplot(111, projection='3d')
-    plt.subplots_adjust(bottom=0.2) 
-
-    #  TẠO NÚT PLAY / PAUSE
-    ax_play = plt.axes([0.15, 0.05, 0.1, 0.04])
-    btn_play = Button(ax_play, 'Play', hovercolor='0.9')
-
-    # Dịch Slider sang phải nhường chỗ cho Nút Play
-    ax_slider = plt.axes([0.35, 0.05, 0.5, 0.04])
-    slider = Slider(ax_slider, 'Khung hinh', 0, max_frames - 1, valinit=0, valfmt='%d')
+    # 3. TIEN XU LY BO LOC VA TINH TOAN GOC CHO TOAN BO SESSION
+    frame_dict = {}
     
-    ax.view_init(elev=0, azim=-90)
+    sh_x, sh_y, sh_z = None, None, None
+    el_x, el_y, el_z = None, None, None
+    wr_x, wr_y, wr_z = None, None, None
+    curr_trail = []
 
-    #  LOGIC CHO BỘ ĐẾM THỜI GIAN VÀ AUTO PLAY
+    print("Dang toi uu hoa toa do dong hoc chuyen dong...")
+    for idx, row in df_cam.iterrows():
+        f_id = int(row["frame"])
+        acc_val = accel_mag_synced[idx]
+        
+        raw = [[row["shoulder_x"], -row["shoulder_y"], -row["shoulder_z"]],
+               [row["elbow_x"], -row["elbow_y"], -row["elbow_z"]],
+               [row["wrist_x"], -row["wrist_y"], -row["wrist_z"]]]
+               
+        if sh_x is None: 
+            sh_x, sh_y, sh_z = raw[0]; el_x, el_y, el_z = raw[1]; wr_x, wr_y, wr_z = raw[2]
+            
+        sh_x = SMOOTH_SH*sh_x + (1-SMOOTH_SH)*raw[0][0]
+        sh_y = SMOOTH_SH*sh_y + (1-SMOOTH_SH)*raw[0][1]
+        sh_z = SMOOTH_SH*sh_z + (1-SMOOTH_SH)*raw[0][2]
+        
+        el_x = SMOOTH_EL*el_x + (1-SMOOTH_EL)*raw[1][0]
+        el_y = SMOOTH_EL*el_y + (1-SMOOTH_EL)*raw[1][1]
+        el_z = SMOOTH_EL*el_z + (1-SMOOTH_EL)*raw[1][2]
+        
+        wr_x = SMOOTH_WR*wr_x + (1-SMOOTH_WR)*raw[2][0]
+        wr_y = SMOOTH_WR*wr_y + (1-SMOOTH_WR)*raw[2][1]
+        wr_z = SMOOTH_WR*wr_z + (1-SMOOTH_WR)*raw[2][2]
+        
+        el_rel = [el_x - sh_x, el_y - sh_y, el_z - sh_z]
+        wr_rel = [wr_x - sh_x, wr_y - sh_y, wr_z - sh_z]
+        
+        curr_trail.append((wr_rel, acc_val))
+        if len(curr_trail) > TRAIL_LENGTH: 
+            curr_trail.pop(0)
+            
+        ang = calculate_elbow_angle([0,0,0], el_rel, wr_rel)
+            
+        frame_dict[f_id] = {
+            "el": el_rel,
+            "wr": wr_rel,
+            "angle": ang,
+            "trail": list(curr_trail),
+            "time_offset": cam_timestamps[idx] - cam_timestamps[0]
+        }
+
+    # 4. THIET KE DO THI PHAN TICH CHUYEN NGHIEP CHIA DOI (DUAL PLOT)
+    fig = plt.figure(figsize=(14, 7))
+    fig.suptitle(f"He Thong Phan Tich Co Sinh Hoc - Session: {Path(session_folder).name}", fontsize=13, fontweight='bold')
+    
+    ax3d = fig.add_subplot(121, projection='3d')
+    ax2d = fig.add_subplot(122)
+    ax2d_twin = ax2d.twinx() 
+    
+    plt.subplots_adjust(bottom=0.2, wspace=0.3)
+    
+    time_axis = [frame_dict[f]["time_offset"] for f in frames if f in frame_dict]
+    angles_axis = [frame_dict[f]["angle"] for f in frames if f in frame_dict]
+    accel_axis = [accel_mag_synced[i] for i, f in enumerate(frames) if f in frame_dict]
+    
+    line_ang, = ax2d.plot(time_axis, angles_axis, 'g-', label='Goc Khuyl Tay (do)', linewidth=2)
+    line_acc, = ax2d_twin.plot(time_axis, accel_axis, 'r-', label='Gia Toc IMU (G)', alpha=0.5, linewidth=1.5)
+    v_cursor = ax2d.axvline(x=0, color='blue', linestyle='--', linewidth=2, label='Frame Hien Tai')
+    
+    ax2d.set_xlabel("Thoi gian (Giay)", fontweight='bold')
+    ax2d.set_ylabel("Goc Gap (Do)", color='g', fontweight='bold')
+    ax2d_twin.set_ylabel("Gia Toc Tong Hop (Clean Magnitude)", color='r', fontweight='bold')
+    ax2d.grid(True, alpha=0.3)
+    
+    lines = [line_ang, line_acc, v_cursor]
+    ax2d.legend(lines, [l.get_label() for l in lines], loc='upper right')
+
+    norm = mcolors.Normalize(vmin=0, vmax=max(accel_mag_synced)*0.8 if max(accel_mag_synced)>0 else 15)
+    cmap = plt.get_cmap('jet')
+
+    slider_ax = plt.axes([0.35, 0.06, 0.45, 0.03])
+    slider = Slider(slider_ax, 'Khung Hinh (Frame)', min_frame, max_frame, valinit=min_frame, valfmt='%d')
+    
+    btn_play_ax = plt.axes([0.15, 0.05, 0.08, 0.05])
+    btn_play = Button(btn_play_ax, '▶ Play', color='#e1f5fe', hovercolor='#b3e5fc')
+    
     play_state = {"is_playing": False}
-    timer = fig.canvas.new_timer(interval=33) # 33ms ~ 30FPS
+    timer = fig.canvas.new_timer(interval=16) 
+
+    last_valid_data = None
 
     def update_graph(val):
-        frame_idx = int(slider.val)
+        nonlocal last_valid_data
+        target_f = int(slider.val)
         
-        # Giữ lại góc xoay hiện tại khi chuột xoay dở
-        current_elev, current_azim = ax.elev, ax.azim
-        
-        ax.clear()
-        
-        el_rel = el_rels[frame_idx]
-        wr_rel = wr_rels[frame_idx]
-        wrist_trail_frame = trails[frame_idx]
-        
-        xs = [0, el_rel[0], wr_rel[0]]
-        ys = [0, el_rel[1], wr_rel[1]]
-        zs = [0, el_rel[2], wr_rel[2]]
+        ax3d.clear()
+        if target_f in frame_dict:
+            last_valid_data = frame_dict[target_f]
+            
+        if last_valid_data is not None:
+            el = last_valid_data["el"]
+            wr = last_valid_data["wr"]
+            angle = last_valid_data["angle"]
+            trail_data = last_valid_data["trail"]
+            current_time = last_valid_data["time_offset"]
+            
+            ax3d.plot([0, el[0], wr[0]], [0, el[1], wr[1]], [0, el[2], wr[2]], 'k-', lw=4)
+            ax3d.scatter([0, el[0], wr[0]], [0, el[1], wr[1]], [0, el[2], wr[2]], c=['r','g','b'], s=120)
+            
+            for i in range(len(trail_data)-1):
+                p1, _ = trail_data[i]
+                p2, acc = trail_data[i+1]
+                ax3d.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]], color=cmap(norm(acc)), lw=3)
+                
+            ax3d.text2D(0.05, 0.95, f"Goc Khuyl: {angle:.1f}°\nThoi gian: {current_time:.3f}s", 
+                        transform=ax3d.transAxes, bbox=dict(facecolor='w', alpha=0.85), fontsize=11)
+            
+            v_cursor.set_xdata([current_time, current_time])
 
-        # Vẽ các khớp và xương cánh tay
-        ax.scatter(xs, ys, zs, s=120, c=['red', 'green', 'blue'])
-        ax.plot(xs, ys, zs, linewidth=4, color='black')
-
-        # Vẽ đường vết quỹ đạo vung tay (Trail)
-        if len(wrist_trail_frame) > 1:
-            tx = [p[0] for p in wrist_trail_frame]
-            ty = [p[1] for p in wrist_trail_frame]
-            tz = [p[2] for p in wrist_trail_frame]
-            ax.plot(tx, ty, tz, alpha=0.6, linewidth=2, color='magenta', linestyle='--')
-
-        # Cấu hình không gian cố định đồng bộ
-        ax.set_xlim(-0.6, 0.6)
-        ax.set_ylim(-0.6, 0.6)
-        ax.set_zlim(-0.6, 0.6)
-        ax.set_box_aspect([1, 1, 1])
-        
-        ax.set_xlabel("X (Left - Right)")
-        ax.set_ylabel("Y (Down - Up)")
-        ax.set_zlabel("Z (Far - Near)")
-        
-        # Áp ngược góc xoay tự do vào frame mới
-        ax.view_init(elev=current_elev, azim=current_azim)
+        ax3d.set_xlim(-0.6, 0.6); ax3d.set_ylim(-0.6, 0.6); ax3d.set_zlim(-0.6, 0.6)
+        ax3d.set_box_aspect([1, 1, 1])
+        ax3d.view_init(elev=10, azim=-90)
+        ax3d.set_title(f"Mo Hinh Xuong Tay 3D - Frame: {target_f}")
         fig.canvas.draw_idle()
 
-    #  HÀM TỰ ĐỘNG TUA KHUNG HÌNH
-    def auto_step():
-        current_val = int(slider.val)
-        if current_val < max_frames - 1:
-            slider.set_val(current_val + 1)
+    def on_step():
+        curr = int(slider.val)
+        if curr < max_frame:
+            slider.set_val(curr + 1)
         else:
-            slider.set_val(0)
-            toggle_play(None) # Dừng lại khi hết video
-
-    #  HÀM XỬ LÝ KHI BẤM NÚT PLAY/PAUSE
-    def toggle_play(event):
-        play_state["is_playing"] = not play_state["is_playing"]
-        if play_state["is_playing"]:
-            btn_play.label.set_text("Pause")
-            timer.start()
-        else:
-            btn_play.label.set_text("Play")
             timer.stop()
-        fig.canvas.draw_idle()
+            play_state["is_playing"] = False
+            btn_play.label.set_text('▶ Play')
 
-    # Kết nối các sự kiện
-    timer.add_callback(auto_step)
+    def toggle_play(event):
+        if play_state["is_playing"]:
+            timer.stop()
+            btn_play.label.set_text('▶ Play')
+        else:
+            timer.start()
+            btn_play.label.set_text('⏸ Pause')
+        play_state["is_playing"] = not play_state["is_playing"]
+
+    def on_key_press(event):
+        if event.key == ' ': 
+            toggle_play(None)
+        elif event.key == 'right': 
+            curr = int(slider.val)
+            if curr < max_frame: slider.set_val(curr + 1)
+        elif event.key == 'left': 
+            curr = int(slider.val)
+            if curr > min_frame: slider.set_val(curr - 1)
+
+    timer.add_callback(on_step)
     btn_play.on_clicked(toggle_play)
     slider.on_changed(update_graph)
+    fig.canvas.mpl_connect('key_press_event', on_key_press)
     
-    update_graph(0) # Hiển thị frame đầu tiên làm mẫu
-
+    update_graph(min_frame)
+    print("\n MEO DIEU KHIEN PHAN TICH:")
+    print("   - Phim [Spacebar]: Bat/Tat Replay tu dong.")
+    print("   - Phim [->] hoac [<-]: Di chuyen tung khung hinh.")
+    print("="*80)
     plt.show()
 
-
-# =====================================================================
-# LUỒNG CHẠY TỰ ĐỘNG: Phân tách gọi từ File .bat hoặc chạy trực tiếp
-# =====================================================================
 if __name__ == "__main__":
-    # Nếu file .bat gọi và truyền đường dẫn folder vào qua sys.argv
-    if len(sys.argv) > 1:
-        TARGET_SESSION = sys.argv[1]
-    else:
-        # Đường dẫn dự phòng nếu bạn lỡ bấm chạy tay trực tiếp file này
-        TARGET_SESSION = "recording/20260602_160951" 
-    
-    interactive_replay(TARGET_SESSION)
+    interactive_replay(sys.argv[1] if len(sys.argv) > 1 else "recording/20260602_160951")

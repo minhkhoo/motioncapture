@@ -1,5 +1,9 @@
-import sys
 import os
+
+os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
+os.environ["FFMPEG_LOG_LEVEL"] = "quiet"
+
+import sys
 import asyncio
 import signal
 import threading
@@ -13,8 +17,6 @@ from pathlib import Path
 
 from imuclient import IMUClient
 from cameraclient import CameraClient
-
-from dataprocessing import live_graph
 from shareddata import shared_data
 
 # =========================
@@ -51,7 +53,7 @@ async def main():
     global recording
 
     # ========================================================
-    #  BƯỚC 1: MENU CHỌN CHẾ ĐỘ CHẠY 
+    #  BƯỚC 1: MENU CHỌN CHẾ ĐỘ CHẠY TRUYỀN THỐNG
     # ========================================================
     print("\n" + "="*40)
     print(" KHỞI ĐỘNG HỆ THỐNG THU THẬP DỮ LIỆU")
@@ -78,7 +80,7 @@ async def main():
 
     if use_camera:
         cam = CameraClient()
-        # START CAMERA THREAD
+        # START CAMERA THREAD (Đảm bảo chạy ngầm bắt khung hình 60 FPS)
         cam_thread = threading.Thread(target=cam.run, daemon=True)
         cam_thread.start()
         print("Luồng Camera 60 FPS đã sẵn sàng.")
@@ -103,9 +105,9 @@ async def main():
             cmd = await asyncio.get_event_loop().run_in_executor(None, input)
             cmd = cmd.strip().lower()
 
-            # =========================
-            # START RECORDING
-            # =========================
+            # ========================================================
+            # LỆNH: START RECORDING
+            # ========================================================
             if cmd == "start":
                 if recording:
                     print("Already recording")
@@ -122,46 +124,47 @@ async def main():
                 recording = True
                 shared_data.graph_running = True
 
-                # Xóa dữ liệu cũ trên biểu đồ
+                # Xóa dữ liệu cũ trên bộ đệm biểu đồ
                 shared_data.camera_buffer.clear()
                 shared_data.imu_buffer.clear()
 
-                # Tạo thư mục phiên có tên VĐV
+                # Tạo thư mục phiên có tên VĐV cấu trúc cũ của bạn
                 time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
                 session_dir = recording_dir / f"{vđv_name}_{time_str}"
                 session_dir.mkdir(parents=True, exist_ok=True)
                 shared_data.session_dir = session_dir
 
-                # Tự động tạo file .bat xem nhanh đồ thị 3D
+                # Tự động tạo file .bat xem nhanh đồ thị 3D sau khi thu dữ liệu
                 bat_file_path = session_dir / "Xem_Do_Thi_3D.bat"
                 bat_content = f"""@echo off
 echo =======================================================
 echo   DANG KHOI DONG DO THI 3D TUONG TAC CHO SESSION NAY   
 echo =======================================================
 cd /d "%~dp0..\\.."
-uv run python dataprocessing.py "%~dp0."
+uv run python dataprocessing.py "recording/{vđv_name}_{time_str}"
 """
                 with open(bat_file_path, "w", encoding="utf-8") as f:
                     f.write(bat_content)
 
                 print(f"SESSION DIR: {session_dir}")
 
-                # Kích hoạt session và bật bộ ghi cho từng thiết bị được chọn
+                # Kích hoạt bộ ghi cho từng thiết bị được chọn
                 if use_imu and imu:
                     imu.open_session(session_dir)
-                    print("imu writer:", imu.writer)
+                    # Giữ nguyên cấu trúc check writer của bạn
+                    if hasattr(imu, 'writer'): print("imu writer:", imu.writer)
                     await imu.send_start()
 
                 if use_camera and cam:
                     cam.open_session(session_dir)
-                    print("cam writer:", cam.writer)
+                    if hasattr(cam, 'writer'): print("cam writer:", cam.writer)
                     cam.start()
 
                 print("[RECORDING STARTED]")
 
-            # =========================
-            # STOP RECORDING
-            # =========================
+            # ========================================================
+            # LỆNH: STOP RECORDING
+            # ========================================================
             elif cmd == "stop":
                 if not recording:
                     print("Not recording")
@@ -178,13 +181,13 @@ uv run python dataprocessing.py "%~dp0."
 
                 if use_camera and cam:
                     cam.stop()
-                    cam.close_session()
+                    cam.close_session()  # Kích hoạt tiến trình quét AI hậu kỳ tự động
 
-                print(" GRAPH STOP - DATA SAVED SUCCESSFULLY")
+                print("=== DATA SAVED & POST-PROCESSING COMPLETED ===")
 
-            # =========================
-            # EXIT
-            # =========================
+            # ========================================================
+            # LỆNH: EXIT
+            # ========================================================
             elif cmd == "exit":
                 break
 
@@ -227,24 +230,14 @@ uv run python dataprocessing.py "%~dp0."
 
             print("Ended")
 
-# =========================
-# RUN
-# =========================
+# =====================================================================
+# KHỞI CHẠY TRỰC TIẾP TRÊN LUỒNG CHÍNH (MAIN THREAD)
+# =====================================================================
 if __name__ == "__main__":
-
-    def run_async():
-        try:
-            asyncio.run(main())
-        except Exception:
-            import traceback
-            traceback.print_exc()
-
-    # Khởi chạy luồng điều khiển Async ngầm
-    async_thread = threading.Thread(
-        target=run_async,
-        daemon=True
-    )
-    async_thread.start()
-
-    # BẮT BUỘC: Matplotlib chạy tại Luồng chính để hiển thị GUI
-    live_graph()                    
+    shared_data.program_running = True
+    try:
+        # Chạy trực tiếp main() trên Luồng chính để lắng nghe tín hiệu CLI và giữ ứng dụng không bị tắt
+        asyncio.run(main())
+    except Exception:
+        import traceback
+        traceback.print_exc()
