@@ -8,22 +8,16 @@ from shareddata import shared_data
 DEVICE_NAME = "Nano33BLE"
 ADDRESS = "FB:5E:F5:A6:04:CB"  # Fallback address
 
-
 class IMUClient:
-    """
-    Runs all BLE operations on a private background thread with its own
-    asyncio event loop.  That thread calls CoInitializeEx(MTA) before
-    touching bleak, so mediapipe/TensorFlow COM pollution in the main
-    thread cannot interfere with WinRT session-change callbacks.
-    """
-
     def __init__(self):
         self.collecting = False
         self._client = None
         self._imu_handle = None
         self._cmd_handle = None
-        self.file = None
-        self.writer = None
+        
+        # SỬ DỤNG RAM ĐỂ LƯU TẠM - TRÁNH NGHẼN BĂNG THÔNG
+        self.ram_buffer = []
+        self.csv_path = None
 
         # Private event loop + thread for BLE
         self._loop = asyncio.new_event_loop()
@@ -31,35 +25,35 @@ class IMUClient:
         self._thread.start()
 
     def open_session(self, session_dir):
-        if self.file:
-            self.file.close()
-        self.file = open(session_dir / "imu_data.csv", "w", newline="")
-        self.writer = csv.writer(self.file)
-        self.writer.writerow(["pc_time", "arduino_time",
-                               "ax", "ay", "az", "gx", "gy", "gz"])
+        # Chỉ lưu đường dẫn và dọn dẹp RAM, KHÔNG MỞ FILE I/O Ở ĐÂY
+        self.csv_path = session_dir / "imu_data.csv"
+        self.ram_buffer.clear()
 
     def close_session(self):
-        if self.file:
-            self.file.flush()
-            self.file.close()
-            self.file = None
-            self.writer = None
+        # KHI KẾT THÚC THU: Đổ toàn bộ data từ RAM vào file CSV 1 lần duy nhất
+        if self.csv_path is not None and len(self.ram_buffer) > 0:
+            print(f"Đang ghi {len(self.ram_buffer)} dòng IMU vào ổ cứng...")
+            with open(self.csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["pc_time", "arduino_time", "ax", "ay", "az", "gx", "gy", "gz"])
+                writer.writerows(self.ram_buffer)
+        
+        self.ram_buffer.clear()
+        self.csv_path = None
 
     # ------------------------------------------------------------------
     # Background thread
     # ------------------------------------------------------------------
 
     def _run_loop(self):
-        """Entry point of the BLE thread.  Sets COM=MTA then runs the loop."""
         if sys.platform == "win32":
             import ctypes
-            ctypes.windll.ole32.CoInitializeEx(None, 0x0)  # COINIT_MULTITHREADED
+            ctypes.windll.ole32.CoInitializeEx(None, 0x0)
             asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
     def _submit(self, coro, timeout=120):
-        """Schedule a coroutine on the BLE thread and block until done."""
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return fut.result(timeout=timeout)
 
@@ -68,47 +62,25 @@ class IMUClient:
     # ------------------------------------------------------------------
 
     def handler(self, sender, data):
-
         if not self.collecting:
             return
 
         pc_time = time.perf_counter()
-
         timestamp, ax, ay, az, gx, gy, gz = struct.unpack("I6f", data)
 
         # =========================
-        # WRITE CSV
+        # LƯU VÀO RAM (Thao tác O(1) cực nhanh, tốn < 1 micro-giây)
         # =========================
-
-        if self.writer is not None:
-
-            self.writer.writerow([
-
-                pc_time,
-                timestamp,
-
-                ax, ay, az,
-
-                gx, gy, gz
-            ])
+        self.ram_buffer.append([
+            pc_time, timestamp, ax, ay, az, gx, gy, gz
+        ])
 
         # =========================
         # LIVE SHARED DATA
         # =========================
-
         shared_data.imu_buffer.append({
-
             "timestamp": pc_time,
-
-            # TEMP:
-            # using accelerometer xyz
-            # as wrist xyz
-
-            "wrist": (
-                ax,
-                ay,
-                az
-            )
+            "wrist": (ax, ay, az)
         })
 
     # ------------------------------------------------------------------
@@ -142,8 +114,7 @@ class IMUClient:
             print(f"  attempt {attempt}/3...")
             try:
                 if sys.platform == "win32":
-                    client = BleakClient(device, timeout=20.0,
-                                         use_cached_services=False)
+                    client = BleakClient(device, timeout=20.0, use_cached_services=False)
                 else:
                     client = BleakClient(device.address, timeout=20.0)
 
@@ -163,9 +134,6 @@ class IMUClient:
                 if imu_char is None or cmd_char is None:
                     raise RuntimeError("characteristics not found")
 
-                # Small settle: the BLE thread has proper MTA so this sleep
-                # does NOT cause a disconnect — it gives the Arduino time
-                # to finish connection parameter negotiation.
                 await asyncio.sleep(0.5)
 
                 if not client.is_connected:
@@ -212,6 +180,7 @@ class IMUClient:
         await loop.run_in_executor(None, lambda: self._submit(self._connect_async()))
 
     async def send_start(self):
+        self.ram_buffer.clear() # Đảm bảo buffer trống trước khi thu
         self.collecting = True
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: self._submit(self._write_cmd(b"START")))
