@@ -88,8 +88,8 @@ async def main():
     if use_imu:
         try:
             imu = IMUClient()
-            await imu.start()
-            print("Kết nối IMU Arduino thành công.")
+            await imu.start_client() # CHỈ KẾT NỐI BLUETOOTH 1 LẦN DUY NHẤT Ở ĐÂY
+            print("Kết nối IMU Arduino thành công và đang giữ liên lạc.")
         except Exception as e:
             print(f"Thất bại khi kết nối Arduino: {e}")
             print("Hệ thống tự động chuyển về chế độ CAMERA ONLY.")
@@ -98,22 +98,25 @@ async def main():
     # Tạo thư mục gốc lưu dữ liệu
     recording_dir.mkdir(parents=True, exist_ok=True)
 
-    print("\n=== HỆ THỐNG SẴN SÀNG (Gõ: start / stop / exit) ===")
-
     try:
+        # VÒNG LẶP CHÍNH: TRẠNG THÁI CHỜ QUAY HOẶC THOÁT
         while True:
+            print("\n=== HỆ THỐNG SẴN SÀNG (Gõ: start / exit) ===")
             cmd = await asyncio.get_event_loop().run_in_executor(None, input)
             cmd = cmd.strip().lower()
 
             # ========================================================
+            # LỆNH: EXIT (CHỈ THOÁT KHI ĐANG RẢNH)
+            # ========================================================
+            if cmd == "exit":
+                print("Đang chuẩn bị đóng toàn bộ hệ thống...")
+                break
+
+            # ========================================================
             # LỆNH: START RECORDING
             # ========================================================
-            if cmd == "start":
-                if recording:
-                    print("Already recording")
-                    continue
-
-                # BƯỚC 2: HỎI TÊN VĐV ĐỂ ĐẶT TÊN THƯ MỤC THÔNG MINH
+            elif cmd == "start":
+                # Hỏi tên VĐV để đặt tên thư mục thông minh
                 def get_player_name():
                     return input("Nhập Tên hoặc Mã số VĐV (Bấm Enter để bỏ qua): ").strip()
                 
@@ -128,13 +131,13 @@ async def main():
                 shared_data.camera_buffer.clear()
                 shared_data.imu_buffer.clear()
 
-                # Tạo thư mục phiên có tên VĐV cấu trúc cũ của bạn
+                # Tạo thư mục phiên có tên VĐV
                 time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
                 session_dir = recording_dir / f"{vđv_name}_{time_str}"
                 session_dir.mkdir(parents=True, exist_ok=True)
                 shared_data.session_dir = session_dir
 
-                # Tự động tạo file .bat xem nhanh đồ thị 3D sau khi thu dữ liệu
+                # Tự động tạo file .bat xem nhanh đồ thị 3D
                 bat_file_path = session_dir / "Xem_Do_Thi_3D.bat"
                 bat_content = f"""@echo off
 echo =======================================================
@@ -148,73 +151,72 @@ uv run python dataprocessing.py "recording/{vđv_name}_{time_str}"
 
                 print(f"SESSION DIR: {session_dir}")
 
-                # Kích hoạt bộ ghi cho từng thiết bị được chọn
+                # Kích hoạt bộ ghi cho từng thiết bị
                 if use_imu and imu:
                     imu.open_session(session_dir)
-                    # Giữ nguyên cấu trúc check writer của bạn
-                    if hasattr(imu, 'writer'): print("imu writer:", imu.writer)
-                    await imu.send_start()
+                    await imu.start_session() # Gửi lệnh START qua BLE công suất thực tế
 
                 if use_camera and cam:
                     cam.open_session(session_dir)
-                    if hasattr(cam, 'writer'): print("cam writer:", cam.writer)
                     cam.start()
 
-                print("[RECORDING STARTED]")
+                print("\n>>> 🔴 ĐANG QUAY DATA (Gõ duy nhất lệnh 'stop' để kết thúc) <<<")
 
-            # ========================================================
-            # LỆNH: STOP RECORDING
-            # ========================================================
-            elif cmd == "stop":
-                if not recording:
-                    print("Not recording")
-                    continue
+                # ----------------------------------------------------
+                # VÒNG LẶP LỒNG: BẮT BUỘC ĐỢI LỆNH STOP KHI ĐANG QUAY
+                # ----------------------------------------------------
+                while True:
+                    sub_cmd = await asyncio.get_event_loop().run_in_executor(None, input)
+                    sub_cmd = sub_cmd.strip().lower()
 
-                recording = False
-                print("[STOPPING SYSTEM]")
+                    if sub_cmd == "stop":
+                        recording = False
+                        shared_data.graph_running = False
+                        print("\n[STOPPING SYSTEM] - Đang dừng thiết bị và kết xuất dữ liệu...")
 
-                shared_data.graph_running = False
+                        if use_imu and imu:
+                            await imu.stop_session() # Dừng luồng và ghi RAM -> CSV (Không ngắt BLE)
 
-                if use_imu and imu:
-                    await imu.send_stop()
-                    imu.close_session()
+                        if use_camera and cam:
+                            cam.stop()
+                            cam.close_session() # Kích hoạt hậu kỳ AI cho Camera
 
-                if use_camera and cam:
-                    cam.stop()
-                    cam.close_session()  # Kích hoạt tiến trình quét AI hậu kỳ tự động
+                        print("=== 100% DATA SAVED & POST-PROCESSING COMPLETED ===")
+                        print("Hệ thống tự động đưa bạn quay lại Menu chính.")
+                        break # Bẻ gãy vòng lặp phụ, quay về Menu chính chờ lệnh start/exit tiếp theo
+                    
+                    elif sub_cmd == "exit":
+                        print("⚠️ CẢNH BÁO: Hệ thống đang ghi dữ liệu! Bạn phải gõ 'stop' trước khi muốn thoát.")
+                    else:
+                        print("❌ Lệnh không hợp lệ! Khi đang quay, bạn chỉ được gõ 'stop'.")
 
-                print("=== DATA SAVED & POST-PROCESSING COMPLETED ===")
-
-            # ========================================================
-            # LỆNH: EXIT
-            # ========================================================
-            elif cmd == "exit":
-                break
+            else:
+                print("❌ Lệnh không hợp lệ! Vui lòng chỉ gõ 'start' hoặc 'exit'.")
 
     except (KeyboardInterrupt, EOFError):
         pass
 
     finally:
+        # ========================================================
+        # DỌN DẸP VÀ NGẮT KẾT NỐI HOÀN TOÀN KHI THOÁT APP
+        # ========================================================
         try:
-            # TỰ ĐỘNG DỪNG NẾU ĐANG GHI MÀ THOÁT ĐỘT NGỘT
             if recording:
-                print("Auto stopping recording...")
+                print("Auto stopping recording due to abrupt exit...")
                 recording = False
                 shared_data.graph_running = False
 
                 if use_imu and imu:
-                    await imu.send_stop()
-                    imu.close_session()
+                    await imu.stop_session()
 
                 if use_camera and cam:
                     cam.stop()
                     cam.close_session()
 
-            # SHUTDOWN AN TOÀN
-            await asyncio.wait_for(
-                shutdown(use_imu, imu),
-                timeout=5
-            )
+            # ĐÓNG KẾT NỐI BLUETOOTH AN TOÀN TRƯỚC KHI KHAI TỬ THREAD
+            if use_imu and imu:
+                print("Đang ngắt kết nối Bluetooth với Arduino...")
+                await imu.exit_client()
 
         except Exception as e:
             print("Shutdown error:", e)
@@ -228,7 +230,7 @@ uv run python dataprocessing.py "recording/{vđv_name}_{time_str}"
             if use_camera and cam_thread:
                 cam_thread.join(timeout=3)
 
-            print("Ended")
+            print("=== ĐÃ THOÁT CHƯƠNG TRÌNH AN TOÀN ===")
 
 # =====================================================================
 # KHỞI CHẠY TRỰC TIẾP TRÊN LUỒNG CHÍNH (MAIN THREAD)

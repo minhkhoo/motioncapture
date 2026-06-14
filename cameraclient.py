@@ -5,6 +5,7 @@ import time
 import threading
 from pathlib import Path
 
+
 class CameraClient:
     def __init__(self):
         # ĐỔI TẠI ĐÂY: Thay 0 thành 1 để nhận camera từ Irunin Webcam

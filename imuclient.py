@@ -5,6 +5,7 @@ import csv
 import time
 import threading
 from shareddata import shared_data
+
 DEVICE_NAME = "Nano33BLE"
 ADDRESS = "FB:5E:F5:A6:04:CB"  # Fallback address
 
@@ -58,30 +59,46 @@ class IMUClient:
         return fut.result(timeout=timeout)
 
     # ------------------------------------------------------------------
-    # Notification handler (called on BLE thread)
+    # Notification handler (ĐÃ CẬP NHẬT ĐỂ BÓC TÁCH BATCH 5 DÒNG)
     # ------------------------------------------------------------------
 
     def handler(self, sender, data):
         if not self.collecting:
             return
 
-        pc_time = time.perf_counter()
-        timestamp, ax, ay, az, gx, gy, gz = struct.unpack("I6f", data)
+        # Thời điểm gói tin 140 bytes cập bến PC
+        pc_time_arrival = time.perf_counter()
+        
+        row_size = 28 # Size của 1 dòng IMU (4 bytes int + 6 * 4 bytes float)
+        num_rows = 5  # Số lượng dòng trong 1 gói batch
+        
+        # Vòng lặp bóc tách từng dòng dữ liệu trong gói 140 bytes
+        for i in range(num_rows):
+            start_idx = i * row_size
+            end_idx = (i + 1) * row_size
+            chunk = data[start_idx:end_idx]
+            
+            # Unpack riêng gói 28 bytes đó ra
+            timestamp, ax, ay, az, gx, gy, gz = struct.unpack("<I6f", chunk)
 
-        # =========================
-        # LƯU VÀO RAM (Thao tác O(1) cực nhanh, tốn < 1 micro-giây)
-        # =========================
-        self.ram_buffer.append([
-            pc_time, timestamp, ax, ay, az, gx, gy, gz
-        ])
+            # Vì 5 dòng này được lấy mẫu cách nhau đúng 10ms (0.01s) trên Arduino
+            # Ta tính toán lại chính xác pc_time cho từng dòng dựa theo thời gian lùi dần
+            row_pc_time = pc_time_arrival - (num_rows - 1 - i) * 0.010
 
-        # =========================
-        # LIVE SHARED DATA
-        # =========================
-        shared_data.imu_buffer.append({
-            "timestamp": pc_time,
-            "wrist": (ax, ay, az)
-        })
+            # =========================
+            # LƯU VÀO RAM 
+            # =========================
+            self.ram_buffer.append([
+                row_pc_time, timestamp, ax, ay, az, gx, gy, gz
+            ])
+
+            # =========================
+            # LIVE SHARED DATA (Đẩy liên tục để luồng camera không bị trễ)
+            # =========================
+            shared_data.imu_buffer.append({
+                "timestamp": row_pc_time,
+                "wrist": (ax, ay, az)
+            })
 
     # ------------------------------------------------------------------
     # BLE coroutines (run on the BLE thread)
@@ -175,24 +192,29 @@ class IMUClient:
     # Public API (called from main thread / main event loop)
     # ------------------------------------------------------------------
 
-    async def start(self):
+    async def start_client(self):
+        """Khởi động kết nối BLE một lần duy nhất khi bật app"""
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: self._submit(self._connect_async()))
 
-    async def send_start(self):
-        self.ram_buffer.clear() # Đảm bảo buffer trống trước khi thu
+    async def start_session(self):
+        """Bắt đầu thu data: Gửi lệnh START và dọn RAM"""
+        self.ram_buffer.clear() 
         self.collecting = True
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: self._submit(self._write_cmd(b"START")))
 
-    async def send_stop(self):
+    async def stop_session(self):
+        """Dừng thu data: Gửi lệnh STOP và đổ RAM ra file CSV. KHÔNG NGẮT BLE"""
         self.collecting = False
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: self._submit(self._write_cmd(b"STOP")))
-
-    async def stop(self):
-        self.collecting = False
+        # Lưu file CSV ngay sau khi Arduino ngừng gửi
         self.close_session()
+
+    async def exit_client(self):
+        """Đóng hoàn toàn chương trình: Ngắt BLE và tắt thread"""
+        self.collecting = False
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: self._submit(self._disconnect_async()))
         self._loop.call_soon_threadsafe(self._loop.stop)
