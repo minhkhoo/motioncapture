@@ -137,17 +137,7 @@ async def main():
                 session_dir.mkdir(parents=True, exist_ok=True)
                 shared_data.session_dir = session_dir
 
-                # Tự động tạo file .bat xem nhanh đồ thị 3D
-                bat_file_path = session_dir / "Xem_Do_Thi_3D.bat"
-                bat_content = f"""@echo off
-echo =======================================================
-echo   DANG KHOI DONG DO THI 3D TUONG TAC CHO SESSION NAY   
-echo =======================================================
-cd /d "%~dp0..\\.."
-uv run python dataprocessing.py "recording/{vđv_name}_{time_str}"
-"""
-                with open(bat_file_path, "w", encoding="utf-8") as f:
-                    f.write(bat_content)
+                # (HTML report sẽ được tạo tự động sau khi stop, bởi dataprocessing.py)
 
                 print(f"SESSION DIR: {session_dir}")
 
@@ -160,7 +150,7 @@ uv run python dataprocessing.py "recording/{vđv_name}_{time_str}"
                     cam.open_session(session_dir)
                     cam.start()
 
-                print("\n>>> 🔴 ĐANG QUAY DATA (Gõ duy nhất lệnh 'stop' để kết thúc) <<<")
+                print("\n>>> ĐANG QUAY DATA (Gõ lệnh 'stop' để kết thúc) <<<")
 
                 # ----------------------------------------------------
                 # VÒNG LẶP LỒNG: BẮT BUỘC ĐỢI LỆNH STOP KHI ĐANG QUAY
@@ -186,12 +176,12 @@ uv run python dataprocessing.py "recording/{vđv_name}_{time_str}"
                         break # Bẻ gãy vòng lặp phụ, quay về Menu chính chờ lệnh start/exit tiếp theo
                     
                     elif sub_cmd == "exit":
-                        print("⚠️ CẢNH BÁO: Hệ thống đang ghi dữ liệu! Bạn phải gõ 'stop' trước khi muốn thoát.")
+                        print(" CẢNH BÁO: Hệ thống đang ghi dữ liệu, gõ 'stop' trước khi muốn thoát.")
                     else:
-                        print("❌ Lệnh không hợp lệ! Khi đang quay, bạn chỉ được gõ 'stop'.")
+                        print(" Lệnh không hợp lệ, chỉ nhận lệnh 'stop'.")
 
             else:
-                print("❌ Lệnh không hợp lệ! Vui lòng chỉ gõ 'start' hoặc 'exit'.")
+                print(" Lệnh không hợp lệ, chỉ nhận lệnh 'start' hoặc 'exit'.")
 
     except (KeyboardInterrupt, EOFError):
         pass
