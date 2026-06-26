@@ -49,6 +49,27 @@ async def shutdown(use_imu, imu_obj):
 # =========================
 # MAIN ASYNC LOOP
 # =========================
+
+# =====================================================================
+# HELPER: Tạo shortcut .bat để double-click mở viewer
+# =====================================================================
+def _write_viewer_bat(session_dir):
+    """Tạo file Open_Viewer.bat trong session folder.
+    Double-click là mở viewer, không cần gõ lệnh terminal.
+    """
+    from pathlib import Path
+    session_dir = Path(session_dir)
+    # Tính đường dẫn tương đối từ session_dir lên root project
+    # session_dir = recording/TenVDV_20260612.../  → cần cd lên 2 cấp
+    bat_content = (
+        "@echo off\n"
+        "cd /d \"%~dp0..\\..\"\n"
+        f'uv run python dataprocessing.py "recording\\{session_dir.name}"\n'
+        "pause\n"
+    )
+    bat_path = session_dir / "Open_Viewer.bat"
+    bat_path.write_text(bat_content, encoding="utf-8")
+
 async def main():
     global recording
 
@@ -170,6 +191,18 @@ async def main():
                         if use_camera and cam:
                             cam.stop()
                             cam.close_session() # Kích hoạt hậu kỳ AI cho Camera
+
+                        # Xuất HTML report (không mở browser vì đang ở CLI loop)
+                        if use_camera and (session_dir / "camera_data.csv").exists():
+                            print("  → Đang xuất motion_report.html ...")
+                            try:
+                                import dataprocessing
+                                dataprocessing.run(str(session_dir), open_browser=False)
+                                _write_viewer_bat(session_dir)
+                                report_path = session_dir / "motion_report.html"
+                                print(f"  → Xem report: uv run python dataprocessing.py {session_dir}")
+                            except Exception as e:
+                                print(f"  ⚠️  Không tạo được report: {e}")
 
                         print("=== 100% DATA SAVED & POST-PROCESSING COMPLETED ===")
                         print("Hệ thống tự động đưa bạn quay lại Menu chính.")
