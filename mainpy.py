@@ -4,6 +4,7 @@ os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
 os.environ["FFMPEG_LOG_LEVEL"] = "quiet"
 
 import sys
+import json
 import asyncio
 import signal
 import threading
@@ -51,16 +52,16 @@ async def shutdown(use_imu, imu_obj):
 # =========================
 
 # =====================================================================
-# HELPER: Tạo shortcut .bat để double-click mở viewer
+# HELPER: create a .bat shortcut to open the viewer by double-clicking
 # =====================================================================
 def _write_viewer_bat(session_dir):
-    """Tạo file Open_Viewer.bat trong session folder.
-    Double-click là mở viewer, không cần gõ lệnh terminal.
+    """Create Open_Viewer.bat inside the session folder.
+    Double-click opens the viewer without typing a terminal command.
     """
     from pathlib import Path
     session_dir = Path(session_dir)
-    # Tính đường dẫn tương đối từ session_dir lên root project
-    # session_dir = recording/TenVDV_20260612.../  → cần cd lên 2 cấp
+    # Compute the relative path from session_dir up to the project root
+    # session_dir = recording/PlayerName_20260612.../  → need to cd up 2 levels
     bat_content = (
         "@echo off\n"
         "cd /d \"%~dp0..\\..\"\n"
@@ -74,107 +75,138 @@ async def main():
     global recording
 
     # ========================================================
-    #  BƯỚC 1: MENU CHỌN CHẾ ĐỘ CHẠY TRUYỀN THỐNG
+    #  STEP 1: MODE SELECTION MENU
     # ========================================================
     print("\n" + "="*40)
-    print(" KHỞI ĐỘNG HỆ THỐNG THU THẬP DỮ LIỆU")
+    print(" STARTING THE DATA COLLECTION SYSTEM")
     print("="*40)
-    print("1. Chỉ quay CAMERA")
-    print("2. Chỉ lưu CẢM BIẾN IMU")
-    print("3. Chạy CẢ HAI thiết bị đồng thời")
+    print("1. CAMERA only")
+    print("2. IMU SENSOR only")
+    print("3. Run BOTH devices simultaneously")
     print("="*40)
 
     def get_mode_input():
-        return input("Nhập lựa chọn của bạn (1/2/3): ").strip()
+        return input("Enter your choice (1/2/3): ").strip()
 
     mode_choice = await asyncio.get_event_loop().run_in_executor(None, get_mode_input)
-    
+
     use_camera = mode_choice in ["1", "3"]
     use_imu = mode_choice in ["2", "3"]
 
-    print(f"\n➔ Trạng thái kích hoạt: CAMERA={use_camera} | IMU={use_imu}\n")
+    print(f"\n➔ Active devices: CAMERA={use_camera} | IMU={use_imu}\n")
 
-    # Khởi tạo các đối tượng dựa trên lựa chọn
+    # Initialize objects based on the chosen mode
     imu = None
     cam = None
     cam_thread = None
 
     if use_camera:
         cam = CameraClient()
-        # START CAMERA THREAD (Đảm bảo chạy ngầm bắt khung hình 60 FPS)
+        # START CAMERA THREAD (runs in the background capturing frames at 60 FPS)
         cam_thread = threading.Thread(target=cam.run, daemon=True)
         cam_thread.start()
-        print("Luồng Camera 60 FPS đã sẵn sàng.")
+        print("Camera 60 FPS thread is ready.")
 
     if use_imu:
         try:
             imu = IMUClient()
-            await imu.start_client() # CHỈ KẾT NỐI BLUETOOTH 1 LẦN DUY NHẤT Ở ĐÂY
-            print("Kết nối IMU Arduino thành công và đang giữ liên lạc.")
+            await imu.start_client() # CONNECT OVER BLUETOOTH ONLY ONCE, HERE
+            print("IMU Arduino connected successfully and holding the link.")
         except Exception as e:
-            print(f"Thất bại khi kết nối Arduino: {e}")
-            print("Hệ thống tự động chuyển về chế độ CAMERA ONLY.")
+            print(f"Failed to connect to the Arduino: {e}")
+            print("Falling back to CAMERA ONLY mode automatically.")
             use_imu = False
 
-    # Tạo thư mục gốc lưu dữ liệu
+    # Create the root data folder
     recording_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        # VÒNG LẶP CHÍNH: TRẠNG THÁI CHỜ QUAY HOẶC THOÁT
+        # MAIN LOOP: idle state, waiting to record or exit
         while True:
-            print("\n=== HỆ THỐNG SẴN SÀNG (Gõ: start / exit) ===")
+            print("\n=== SYSTEM READY (type: start / exit) ===")
             cmd = await asyncio.get_event_loop().run_in_executor(None, input)
             cmd = cmd.strip().lower()
 
             # ========================================================
-            # LỆNH: EXIT (CHỈ THOÁT KHI ĐANG RẢNH)
+            # COMMAND: EXIT (only allowed while idle)
             # ========================================================
             if cmd == "exit":
-                print("Đang chuẩn bị đóng toàn bộ hệ thống...")
+                print("Preparing to shut down the whole system...")
                 break
 
             # ========================================================
-            # LỆNH: START RECORDING
+            # COMMAND: START RECORDING
             # ========================================================
             elif cmd == "start":
-                # Hỏi tên VĐV để đặt tên thư mục thông minh
-                def get_player_name():
-                    return input("Nhập Tên hoặc Mã số VĐV (Bấm Enter để bỏ qua): ").strip()
-                
-                vđv_name = await asyncio.get_event_loop().run_in_executor(None, get_player_name)
-                if not vđv_name:
-                    vđv_name = "Player"
+                # Ask for the session KIND before recording. The session_info.json
+                # written here is the source of truth that promote_session.py /
+                # prepare_dataset.py use to tell real data from test sessions to drop.
+                def get_session_kind():
+                    while True:
+                        print("\nSession kind?  [1] professional   [2] amateur   "
+                              "[3] test")
+                        c = input("Enter your choice (1/2/3): ").strip()
+                        if c in ("1", "2", "3"):
+                            return {"1": "professional", "2": "amateur", "3": "test"}[c]
+                        print("  Invalid input. Only 1, 2 or 3 are accepted.")
+
+                session_kind = await asyncio.get_event_loop().run_in_executor(
+                    None, get_session_kind)
+
+                # Test session: do NOT ask for a name. Real session: ask for the athlete name as before.
+                player_id = None
+                if session_kind in ("professional", "amateur"):
+                    def get_player_name():
+                        return input("Enter athlete name or ID (press Enter to skip): ").strip()
+                    player_id = await asyncio.get_event_loop().run_in_executor(
+                        None, get_player_name)
+                    if not player_id:
+                        player_id = "Player"
 
                 recording = True
                 shared_data.graph_running = True
 
-                # Xóa dữ liệu cũ trên bộ đệm biểu đồ
+                # Clear the old chart buffers
                 shared_data.camera_buffer.clear()
                 shared_data.imu_buffer.clear()
 
-                # Tạo thư mục phiên có tên VĐV
+                # Folder name: test sessions start with TEST_ so they're obvious at a glance.
+                # Do NOT append a primary/secondary suffix — that is assigned later after
+                # reviewing the video; it isn't known at recording time.
                 time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-                session_dir = recording_dir / f"{vđv_name}_{time_str}"
+                if session_kind == "test":
+                    session_dir = recording_dir / f"TEST_{time_str}"
+                else:
+                    session_dir = recording_dir / f"{player_id}_{time_str}"
                 session_dir.mkdir(parents=True, exist_ok=True)
                 shared_data.session_dir = session_dir
 
-                # (HTML report sẽ được tạo tự động sau khi stop, bởi dataprocessing.py)
+                # session_info.json — source of truth about the session kind
+                session_info = {
+                    "session_kind": session_kind,
+                    "player_id":    player_id,      # None if this is a test
+                    "recorded_at":  datetime.now().isoformat(),
+                }
+                (session_dir / "session_info.json").write_text(
+                    json.dumps(session_info, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
 
-                print(f"SESSION DIR: {session_dir}")
+                # (The HTML report is generated automatically after stop, by dataprocessing.py)
 
-                # Kích hoạt bộ ghi cho từng thiết bị
+                print(f"SESSION DIR: {session_dir}  [{session_kind}]")
+
+                # Activate the recorder for each device
                 if use_imu and imu:
                     imu.open_session(session_dir)
-                    await imu.start_session() # Gửi lệnh START qua BLE công suất thực tế
-
+                    await imu.start_session() # Send START over BLE
                 if use_camera and cam:
                     cam.open_session(session_dir)
                     cam.start()
 
-                print("\n>>> ĐANG QUAY DATA (Gõ lệnh 'stop' để kết thúc) <<<")
+                print("\n>>> RECORDING DATA (type 'stop' to finish) <<<")
 
                 # ----------------------------------------------------
-                # VÒNG LẶP LỒNG: BẮT BUỘC ĐỢI LỆNH STOP KHI ĐANG QUAY
+                # NESTED LOOP: must wait for the STOP command while recording
                 # ----------------------------------------------------
                 while True:
                     sub_cmd = await asyncio.get_event_loop().run_in_executor(None, input)
@@ -183,45 +215,45 @@ async def main():
                     if sub_cmd == "stop":
                         recording = False
                         shared_data.graph_running = False
-                        print("\n[STOPPING SYSTEM] - Đang dừng thiết bị và kết xuất dữ liệu...")
+                        print("\n[STOPPING SYSTEM] - Stopping devices and exporting data...")
 
                         if use_imu and imu:
-                            await imu.stop_session() # Dừng luồng và ghi RAM -> CSV (Không ngắt BLE)
+                            await imu.stop_session() # Stop the stream and write RAM -> CSV (does not disconnect BLE)
 
                         if use_camera and cam:
                             cam.stop()
-                            cam.close_session() # Kích hoạt hậu kỳ AI cho Camera
+                            cam.close_session() # Trigger AI post-processing for the camera
 
-                        # Xuất HTML report (không mở browser vì đang ở CLI loop)
+                        # Export the HTML report (don't open a browser — we're in the CLI loop)
                         if use_camera and (session_dir / "camera_data.csv").exists():
-                            print("  → Đang xuất motion_report.html ...")
+                            print("  → Exporting motion_report.html ...")
                             try:
                                 import dataprocessing
                                 dataprocessing.run(str(session_dir), open_browser=False)
                                 _write_viewer_bat(session_dir)
                                 report_path = session_dir / "motion_report.html"
-                                print(f"  → Xem report: uv run python dataprocessing.py {session_dir}")
+                                print(f"  → View report: uv run python dataprocessing.py {session_dir}")
                             except Exception as e:
-                                print(f"  ⚠️  Không tạo được report: {e}")
+                                print(f"  ⚠️  Could not create the report: {e}")
 
                         print("=== 100% DATA SAVED & POST-PROCESSING COMPLETED ===")
-                        print("Hệ thống tự động đưa bạn quay lại Menu chính.")
-                        break # Bẻ gãy vòng lặp phụ, quay về Menu chính chờ lệnh start/exit tiếp theo
-                    
+                        print("Returning you to the main menu automatically.")
+                        break # Break the inner loop, back to the main menu for the next start/exit
+
                     elif sub_cmd == "exit":
-                        print(" CẢNH BÁO: Hệ thống đang ghi dữ liệu, gõ 'stop' trước khi muốn thoát.")
+                        print(" WARNING: recording in progress — type 'stop' before exiting.")
                     else:
-                        print(" Lệnh không hợp lệ, chỉ nhận lệnh 'stop'.")
+                        print(" Invalid command, only 'stop' is accepted.")
 
             else:
-                print(" Lệnh không hợp lệ, chỉ nhận lệnh 'start' hoặc 'exit'.")
+                print(" Invalid command, only 'start' or 'exit' are accepted.")
 
     except (KeyboardInterrupt, EOFError):
         pass
 
     finally:
         # ========================================================
-        # DỌN DẸP VÀ NGẮT KẾT NỐI HOÀN TOÀN KHI THOÁT APP
+        # CLEAN UP AND FULLY DISCONNECT WHEN EXITING THE APP
         # ========================================================
         try:
             if recording:
@@ -236,9 +268,9 @@ async def main():
                     cam.stop()
                     cam.close_session()
 
-            # ĐÓNG KẾT NỐI BLUETOOTH AN TOÀN TRƯỚC KHI KHAI TỬ THREAD
+            # Safely close the Bluetooth connection before killing the thread
             if use_imu and imu:
-                print("Đang ngắt kết nối Bluetooth với Arduino...")
+                print("Disconnecting Bluetooth from the Arduino...")
                 await imu.exit_client()
 
         except Exception as e:
@@ -253,15 +285,15 @@ async def main():
             if use_camera and cam_thread:
                 cam_thread.join(timeout=3)
 
-            print("=== ĐÃ THOÁT CHƯƠNG TRÌNH AN TOÀN ===")
+            print("=== PROGRAM EXITED SAFELY ===")
 
 # =====================================================================
-# KHỞI CHẠY TRỰC TIẾP TRÊN LUỒNG CHÍNH (MAIN THREAD)
+# RUN DIRECTLY ON THE MAIN THREAD
 # =====================================================================
 if __name__ == "__main__":
     shared_data.program_running = True
     try:
-        # Chạy trực tiếp main() trên Luồng chính để lắng nghe tín hiệu CLI và giữ ứng dụng không bị tắt
+        # Run main() directly on the main thread to listen for CLI signals and keep the app alive
         asyncio.run(main())
     except Exception:
         import traceback

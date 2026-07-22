@@ -1,19 +1,19 @@
 """
 dataprocessing.py — Motion Capture Report Generator (unified entry point)
 =========================================================================
-Dùng được theo 2 cách:
+Can be used in 2 ways:
 
-  1. Từ session folder có sẵn CSV:
+  1. From a session folder that already has CSVs:
        uv run python dataprocessing.py recording/Hoang_20260612_110759
 
-  2. Từ file video bất kỳ (phân tích hậu kỳ):
+  2. From any video file (offline analysis):
        uv run python dataprocessing.py spike.mp4
        uv run python dataprocessing.py spike.mp4 --side LEFT --complexity 2
 
-Options (chỉ dùng khi input là video file):
-  --side        RIGHT | LEFT  (mặc định: RIGHT)
-  --complexity  0 | 1 | 2    (mặc định: 1)
-  --out         <folder>      session output folder tùy chỉnh
+Options (only used when the input is a video file):
+  --side        RIGHT | LEFT  (default: RIGHT)
+  --complexity  0 | 1 | 2    (default: 1)
+  --out         <folder>      custom session output folder
 """
 
 import argparse
@@ -49,7 +49,7 @@ def calculate_elbow_angle(shoulder, elbow, wrist):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# BƯỚC A: TRÍCH XUẤT POSE TỪ VIDEO
+# STEP A: EXTRACT POSE FROM VIDEO
 # ──────────────────────────────────────────────────────────────────────
 def extract_pose_from_video(
     video_path: Path,
@@ -58,9 +58,9 @@ def extract_pose_from_video(
     model_complexity: int = 1,
 ) -> bool:
     """
-    Chạy MediaPipe Pose trên video, xuất đồng thời:
+    Run MediaPipe Pose on the video, exporting both:
       - camera_data.csv  (landmark coordinates)
-      - annotated_video.mp4  (video gốc + skeleton overlay)
+      - annotated_video.mp4  (original video + skeleton overlay)
     """
     mp_pose    = mp.solutions.pose
     mp_drawing = mp.solutions.drawing_utils
@@ -76,14 +76,14 @@ def extract_pose_from_video(
                   mp_pose.PoseLandmark.LEFT_WRIST),
     }
     if side not in landmarks:
-        print(f"[LỖI] --side phải là RIGHT hoặc LEFT")
+        print(f"[ERROR] --side must be RIGHT or LEFT")
         return False
     SHOULDER, ELBOW, WRIST = landmarks[side]
 
-    # Custom style cho xương tay đang phân tích — nổi bật hơn toàn thân
+    # Custom style for the analyzed arm skeleton — more prominent than the full body
     TRACKED_COLOR = (0, 229, 255)   # cyan BGR
     TRACKED_THICK = 4
-    OTHER_COLOR   = (80, 80, 80)    # xám mờ cho phần còn lại
+    OTHER_COLOR   = (80, 80, 80)    # dim gray for the rest
 
     pose = mp_pose.Pose(
         static_image_mode=False,
@@ -95,7 +95,7 @@ def extract_pose_from_video(
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        print(f"[LỖI] Không mở được video: {video_path}")
+        print(f"[ERROR] Could not open video: {video_path}")
         return False
 
     total   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -104,8 +104,8 @@ def extract_pose_from_video(
     h       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     print(f"  → Video: {w}×{h} @ {src_fps:.1f} FPS · {total} frames")
-    print(f"  → Phân tích tay {side} | complexity={model_complexity}")
-    print(f"  → Xuất skeleton overlay → annotated_video.mp4")
+    print(f"  → Analyzing {side} arm | complexity={model_complexity}")
+    print(f"  → Exporting skeleton overlay → annotated_video.mp4")
 
     # VideoWriter cho annotated output (mp4v = H.264-compatible trong QWebEngineView)
     annotated_path = output_csv.parent / "annotated_video.mp4"
@@ -150,7 +150,7 @@ def extract_pose_from_video(
                 rows += 1
 
                 # ── SKELETON OVERLAY ──────────────────────────────────
-                # 1. Vẽ toàn bộ pose connections màu xám mờ (full body context)
+                # 1. Draw all pose connections in dim gray (full body context)
                 mp_drawing.draw_landmarks(
                     annotated,
                     results.pose_landmarks,
@@ -161,7 +161,7 @@ def extract_pose_from_video(
                         color=OTHER_COLOR, thickness=1),
                 )
 
-                # 2. Vẽ đè xương tay đang phân tích — highlight rõ hơn
+                # 2. Overlay the analyzed arm skeleton — brighter highlight
                 sx, sy = int(s.x * w), int(s.y * h)
                 ex, ey = int(e.x * w), int(e.y * h)
                 wx, wy = int(wr_.x * w), int(wr_.y * h)
@@ -175,7 +175,7 @@ def extract_pose_from_video(
                     cv2.circle(annotated, (px, py), radius + 2, (0, 0, 0), -1)       # border
                     cv2.circle(annotated, (px, py), radius,     TRACKED_COLOR, -1)   # fill
 
-                # 3. Góc khuỷu tay (text overlay)
+                # 3. Elbow angle (text overlay)
                 ang = calculate_elbow_angle(
                     [s.x, s.y, s.z], [e.x, e.y, e.z], [wr_.x, wr_.y, wr_.z]
                 )
@@ -211,16 +211,16 @@ def extract_pose_from_video(
     vw.release()
 
     if rows == 0:
-        print("  ⚠️  MediaPipe không phát hiện tư thế nào. Thử --complexity 2.")
+        print("  ⚠️  MediaPipe detected no pose. Try --complexity 2.")
         return False
 
-    print(f"  ✅ {rows} dòng data ({rows/fidx*100:.1f}% detection rate)")
-    print(f"  ✅ annotated_video.mp4 đã xuất")
+    print(f"  ✅ {rows} data rows ({rows/fidx*100:.1f}% detection rate)")
+    print(f"  ✅ annotated_video.mp4 exported")
     return True
 
 
 # ──────────────────────────────────────────────────────────────────────
-# BƯỚC B: ĐỌC CSV + EMA FILTER + DATA FUSION
+# STEP B: READ CSV + EMA FILTER + DATA FUSION
 # ──────────────────────────────────────────────────────────────────────
 def process_session(session_folder: Path) -> dict | None:
     csv_path   = session_folder / "camera_data.csv"
@@ -228,10 +228,10 @@ def process_session(session_folder: Path) -> dict | None:
     video_path = session_folder / "raw_video.mp4"
 
     if not csv_path.exists():
-        print(f"[LỖI] Không tìm thấy: {csv_path}")
+        print(f"[ERROR] Not found: {csv_path}")
         return None
 
-    print("  → Đọc camera_data.csv ...")
+    print("  → Reading camera_data.csv ...")
     df = pd.read_csv(csv_path)
     cam_ts = df["timestamp"].values
     frames = df["frame"].values.astype(int)
@@ -240,7 +240,7 @@ def process_session(session_folder: Path) -> dict | None:
     accel = np.zeros(len(df))
     has_imu = False
     if imu_path.exists():
-        print("  → Data Fusion với IMU ...")
+        print("  → Data fusion with IMU ...")
         df_imu = pd.read_csv(imu_path)
         has_imu = True
         mag = np.sqrt(df_imu["ax"]**2 + df_imu["ay"]**2 + df_imu["az"]**2)
@@ -252,7 +252,7 @@ def process_session(session_folder: Path) -> dict | None:
             accel = np.interp(np.arange(len(df)), idx, clean.values)
 
     # EMA filter
-    print("  → EMA filter + tính góc ...")
+    print("  → EMA filter + angle computation ...")
     sh_x = sh_y = sh_z = None
     el_x = el_y = el_z = None
     wr_x = wr_y = wr_z = None
@@ -301,9 +301,22 @@ def process_session(session_folder: Path) -> dict | None:
         }
 
     valid = [f for f in frames if f in fd]
-    src_fps = float(df["timestamp"].diff().median()**-1) if len(df) > 1 else 60.0
-    if src_fps <= 0 or src_fps > 240:
-        src_fps = 60.0
+
+    # src_fps MUST match the FPS actually declared in the video file, because the
+    # browser plays the <video> at that FPS (not the real capture rate from
+    # perf_counter) — a wrong value here makes the video and the graph run at different speeds.
+    src_fps = None
+    _video_for_fps = video_path if video_path.exists() else session_folder / "annotated_video.mp4"
+    if _video_for_fps.exists():
+        _cap = cv2.VideoCapture(str(_video_for_fps))
+        _real_fps = _cap.get(cv2.CAP_PROP_FPS)
+        _cap.release()
+        if _real_fps and 0 < _real_fps <= 240:
+            src_fps = float(_real_fps)
+    if src_fps is None:
+        src_fps = float(df["timestamp"].diff().median()**-1) if len(df) > 1 else 60.0
+        if src_fps <= 0 or src_fps > 240:
+            src_fps = 60.0
 
     return {
         "session_name": session_folder.name,
@@ -320,7 +333,7 @@ def process_session(session_folder: Path) -> dict | None:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# BƯỚC C: SINH HTML (dùng cho PyQt6 WebEngineView)
+# STEP C: GENERATE HTML (used by the PyQt6 WebEngineView)
 # ──────────────────────────────────────────────────────────────────────
 def generate_html(data: dict, output_path: Path):
     sn        = data["session_name"]
@@ -328,27 +341,27 @@ def generate_html(data: dict, output_path: Path):
     has_video = data["has_video"]
     src_fps   = data.get("src_fps", 60.0)
 
-    # Video src — PyQt6 serve file:// trực tiếp qua QMediaPlayer, không cần workaround
+    # Video src — PyQt6 serves file:// directly via QMediaPlayer, no workaround needed
     video_tag = (
         '<video id="mainVideo" preload="auto" playsinline>'
         f'<source src="raw_video.mp4" type="video/mp4">'
         '</video>'
     ) if has_video else (
-        '<div class="no-video">📹 Không có video đính kèm</div>'
+        '<div class="no-video">📹 No video attached</div>'
     )
 
     imu_badge_cls  = "active"  if has_imu else "inactive"
     imu_badge_text = "● IMU FUSED" if has_imu else "○ CAM ONLY"
-    chart_title    = "📈 Góc Khuỷu Tay & Gia Tốc IMU" if has_imu else "📈 Góc Khuỷu Tay"
+    chart_title    = "📈 Elbow Angle & IMU Acceleration" if has_imu else "📈 Elbow Angle"
 
     y2_layout = (
-        'yaxis2:{gridcolor:"rgba(0,0,0,0)",title:{text:"Gia tốc (G)",font:{size:9,color:"#ff6b35"}},'
+        'yaxis2:{gridcolor:"rgba(0,0,0,0)",title:{text:"Acceleration (G)",font:{size:9,color:"#ff6b35"}},'
         'overlaying:"y",side:"right",tickfont:{color:"#ff6b35",size:9}},'
     ) if has_imu else ""
 
     acc_trace = (
         'chartTraces.push({type:"scatter",mode:"lines",x:timeSeries,y:accSeries,'
-        'line:{color:"#ff6b35",width:1.5},opacity:0.6,name:"Gia tốc (G)",yaxis:"y2"});'
+        'line:{color:"#ff6b35",width:1.5},opacity:0.6,name:"Acceleration (G)",yaxis:"y2"});'
     ) if has_imu else ""
 
     payload = json.dumps({
@@ -463,7 +476,7 @@ kbd{{background:var(--card);border:1px solid var(--border);border-radius:3px;
       {video_tag}
       <div id="vidOverlay">
         <div class="spinner"></div>
-        <span id="overlayMsg">Đang tải video...</span>
+        <span id="overlayMsg">Loading video...</span>
       </div>
     </div>
     <div class="ctrl-area">
@@ -522,11 +535,11 @@ const hasIMU = P.has_imu;
 const FPS = P.src_fps || 60.0;
 const minF = frames[0], maxF = frames[frames.length - 1];
 
-// Lấy elements — null-safe vì Qt cắt left panel khi dùng viewer
+// Grab elements — null-safe because Qt strips the left panel in the viewer
 const sl  = document.getElementById('slider');
 const btn = document.getElementById('btnPlay');
 const vid = document.getElementById('mainVideo');
-// Slider chỉ tồn tại khi mở HTML thuần, không tồn tại trong PyQt viewer
+// The slider only exists when opening the plain HTML, not in the PyQt viewer
 if (sl) {{
   sl.min = minF; sl.max = maxF; sl.value = minF;
   sl.addEventListener('input', () => seek(+sl.value));
@@ -593,21 +606,21 @@ Plotly.newPlot('gBird', [
 
 const chartTraces = [
   {{ type:'scatter', mode:'lines', x:timeSeries, y:angleSeries,
-     line:{{color:'#39d98a',width:2}}, name:'Góc khuỷu (°)' }},
+     line:{{color:'#39d98a',width:2}}, name:'Elbow angle (°)' }},
 ];
 {acc_trace}
 chartTraces.push({{
   type:'scatter', mode:'lines',
   x:[timeSeries[0]||0, timeSeries[0]||0], y:[0, 180],
   line:{{color:'#00e5ff',width:1.5,dash:'dash'}},
-  name:'Frame hiện tại', showlegend:false,
+  name:'Current frame', showlegend:false,
 }});
 const cursorIdx = chartTraces.length - 1;
 
 Plotly.newPlot('chartAngle', chartTraces, {{
   ...DARK, margin:{{l:46,r:{52 if has_imu else 16},t:8,b:34}},
-  xaxis:{{...AX, title:{{text:'Thời gian (s)',font:{{size:9}}}}}},
-  yaxis:{{...AX, title:{{text:'Góc (°)',font:{{size:9,color:'#39d98a'}}}},
+  xaxis:{{...AX, title:{{text:'Time (s)',font:{{size:9}}}}}},
+  yaxis:{{...AX, title:{{text:'Angle (°)',font:{{size:9,color:'#39d98a'}}}},
     range:[0,180], tickfont:{{color:'#39d98a',size:9}}}},
   {y2_layout}
   showlegend:true,
@@ -615,7 +628,7 @@ Plotly.newPlot('chartAngle', chartTraces, {{
     bordercolor:'#262f42',borderwidth:1}},
 }}, {{responsive:true, displayModeBar:false}});
 
-// VIDEO SETUP — null-safe (vid không tồn tại trong PyQt viewer)
+// VIDEO SETUP — null-safe (vid doesn't exist in the PyQt viewer)
 let videoReady = false;
 if (vid) {{
   const overlay    = document.getElementById('vidOverlay');
@@ -625,13 +638,13 @@ if (vid) {{
     if (overlay) overlay.classList.add('hidden');
   }}
   vid.addEventListener('loadedmetadata', () => {{
-    if (overlayMsg) overlayMsg.textContent = 'Đang buffer...';
+    if (overlayMsg) overlayMsg.textContent = 'Buffering...';
   }});
   vid.addEventListener('canplay', markReady);
   vid.addEventListener('canplaythrough', markReady);
   vid.addEventListener('error', () => {{
     if (overlay) overlay.classList.remove('hidden');
-    if (overlayMsg) overlayMsg.textContent = '⚠️ Không load được video (codec không hỗ trợ?)';
+    if (overlayMsg) overlayMsg.textContent = '⚠️ Could not load the video (unsupported codec?)';
     videoReady = false;
   }});
   if (vid.readyState >= 3) markReady();
@@ -712,14 +725,14 @@ seek(minF);
 </html>"""
 
     output_path.write_text(html, encoding="utf-8")
-    print(f"\n✅ motion_report.html đã xuất tại: {output_path}")
+    print(f"\n✅ motion_report.html saved to: {output_path}")
 
 
 # ──────────────────────────────────────────────────────────────────────
-# BƯỚC D: PyQt6 VIEWER
-# Layout: QSplitter ngang — trái: video pane (QMediaPlayer+QVideoWidget)
-#         phải: QWebEngineView (graphs + controls)
-# Video do Qt native decode → không phụ thuộc codec Chromium
+# STEP D: PyQt6 VIEWER
+# Layout: horizontal QSplitter — left: video pane (QMediaPlayer+QVideoWidget)
+#         right: QWebEngineView (graphs + controls)
+# Video is decoded natively by Qt → independent of the Chromium codec
 # ──────────────────────────────────────────────────────────────────────
 def launch_pyqt_viewer(session_folder: Path, report_path: Path):
     try:
@@ -734,34 +747,76 @@ def launch_pyqt_viewer(session_folder: Path, report_path: Path):
         from PyQt6.QtCore import QUrl, Qt, QTimer, pyqtSignal, QObject
         from PyQt6.QtGui import QColor, QPalette
     except ModuleNotFoundError as exc:
-        print(f"\n⚠️  Module thiếu: {exc}")
-        print("   Chạy: uv add pyqt6-webengine")
+        print(f"\n⚠️  Missing module: {exc}")
+        print("   Run: uv add pyqt6-webengine")
         print(f"\n   Report: {report_path}")
         return
     import sys as _sys
 
-    # ── Chọn file video: ưu tiên annotated, fallback raw ──────────────
+    # ── Choose the video file: prefer annotated, fall back to raw ─────
     annotated = session_folder / "annotated_video.mp4"
     raw_src   = session_folder / "raw_video.mp4"
     video_file = annotated if annotated.exists() else raw_src
     has_annotated = annotated.exists()
-    showing_annotated = has_annotated  # track trạng thái toggle
+    showing_annotated = has_annotated  # track the toggle state
 
-    # ── Patch HTML: bỏ video tag, bỏ vidOverlay, chỉ giữ graphs+controls ──
+    # ── FPS SYNC: distinguish 2 DIFFERENT quantities, don't mix them ──
+    #  • declared_fps: the FPS in the video file header = the file's own timebase.
+    #    QMediaPlayer.position() is MEDIA TIME (unchanged by playbackRate), so frame
+    #    f always sits at position f/declared_fps → frame↔position conversion MUST use
+    #    this value. Using real_fps here would give a position beyond the file length.
+    #  • real_fps: the TRUE capture rate, read from the timestamps in camera_data.csv.
+    # The video is written at a fixed 60fps but the real camera reaches only ~25-60fps →
+    # the file plays faster than real life. Compensate with playbackRate = real/declared
+    # (media time stays the same, it just slows by exactly the shortfall) → the video
+    # matches the graph's speed.
+    def _probe_declared_fps(path: Path) -> float:
+        _c = cv2.VideoCapture(str(path))
+        _d = _c.get(cv2.CAP_PROP_FPS)
+        _c.release()
+        return float(_d) if _d and 0 < _d <= 240 else 60.0
+
+    def _probe_real_fps() -> float:
+        _p = session_folder / "camera_data.csv"
+        if not _p.exists():
+            return 0.0
+        try:
+            _d = pd.read_csv(_p)
+        except Exception:
+            return 0.0
+        if len(_d) < 2:
+            return 0.0
+        _span = float(_d["timestamp"].iloc[-1] - _d["timestamp"].iloc[0])
+        # Use the FRAME-INDEX SPAN, not the row count: frames where MediaPipe fails to
+        # detect a pose have no CSV row, so counting rows would give an FPS lower than
+        # reality and playbackRate would still be off.
+        _fspan = float(_d["frame"].iloc[-1] - _d["frame"].iloc[0])
+        if _span <= 0 or _fspan <= 0:
+            return 0.0
+        _r = _fspan / _span
+        return _r if 0 < _r <= 240 else 0.0
+
+    _fps      = _probe_declared_fps(video_file)   # the video file's timebase
+    _real_fps = _probe_real_fps() or _fps         # the real-world capture rate
+    _rate     = _real_fps / _fps if _fps > 0 else 1.0
+    print(f"  → Video declared {_fps:.1f} fps · real capture {_real_fps:.1f} fps "
+          f"· playbackRate {_rate:.3f}")
+
+    # ── Patch the HTML: drop the video tag & vidOverlay, keep only graphs+controls ──
     html_text = report_path.read_text(encoding="utf-8")
-    # Xoá toàn bộ left panel khỏi HTML — Qt tự làm video pane
-    # Thay .main grid thành 1 cột, chỉ hiện right panel
+    # Remove the entire left panel from the HTML — Qt provides the video pane itself
+    # Change the .main grid to a single column, showing only the right panel
     import re
-    # Xóa toàn bộ left panel khỏi HTML bằng string split chính xác
-    # Tìm vị trí bắt đầu và kết thúc của <div class="left">...</div>
+    # Remove the whole left panel from the HTML with a precise string split
+    # Find the start and end of <div class="left">...</div>
     LEFT_START  = '<div class="left">'
     RIGHT_START = '<div class="right">'
     if LEFT_START in html_text and RIGHT_START in html_text:
         idx_left  = html_text.index(LEFT_START)
         idx_right = html_text.index(RIGHT_START)
-        # Xóa toàn bộ phần từ đầu left đến ngay trước right
+        # Remove everything from the start of left up to just before right
         html_text = html_text[:idx_left] + html_text[idx_right:]
-    # Đổi grid sang 1 cột vì left panel đã bị xóa
+    # Switch the grid to a single column since the left panel is gone
     html_text = html_text.replace(
         "grid-template-columns:400px 1fr",
         "grid-template-columns:1fr"
@@ -789,7 +844,7 @@ def launch_pyqt_viewer(session_folder: Path, report_path: Path):
     window.setWindowTitle(f"Motion Analysis · {session_folder.name}")
     window.resize(1600, 920)
 
-    # ── SPLITTER: video trái | graphs phải ─────────────────────────────
+    # ── SPLITTER: video left | graphs right ─────────────────────────────
     splitter = QSplitter(Qt.Orientation.Horizontal)
     splitter.setHandleWidth(2)
     splitter.setStyleSheet("QSplitter::handle { background: #262f42; }")
@@ -832,7 +887,7 @@ def launch_pyqt_viewer(session_folder: Path, report_path: Path):
     # ── Media player ───────────────────────────────────────────────────
     player   = QMediaPlayer()
     audio    = QAudioOutput()
-    audio.setVolume(0.0)   # mute (không cần tiếng)
+    audio.setVolume(0.0)   # mute (no audio needed)
     player.setAudioOutput(audio)
     player.setVideoOutput(video_widget)
 
@@ -913,7 +968,7 @@ def launch_pyqt_viewer(session_folder: Path, report_path: Path):
         ctrl_layout.addWidget(w)
     ctrl_layout.addStretch()
 
-    # Toggle annotated button (chỉ hiện nếu có annotated video)
+    # Toggle annotated button (only shown if an annotated video exists)
     btn_annot = None
     if has_annotated:
         btn_annot = QPushButton("📹 Annotated")
@@ -965,7 +1020,9 @@ def launch_pyqt_viewer(session_folder: Path, report_path: Path):
     _payload = _json.loads(_m.group(1)) if _m else {}
     _frames   = _payload.get("frames", [])
     _fd       = _payload.get("frame_dict", {})
-    _fps      = float(_payload.get("src_fps", 60.0))
+    # _fps / _real_fps / _rate were measured above DIRECTLY from the video being played.
+    # No longer take src_fps from the payload: the payload reads raw_video.mp4's FPS, while
+    # the viewer plays annotated_video.mp4 — the two files may declare different FPS.
 
     if _frames:
         tl_slider.setMinimum(_frames[0])
@@ -996,7 +1053,13 @@ def launch_pyqt_viewer(session_folder: Path, report_path: Path):
         _update_info(f)
         if not from_video:
             _skip_video_cb = True
-            target_ms = int((f - tl_slider.minimum()) / _fps * 1000)
+            # the frame in camera_data.csv is the ABSOLUTE frame index in the video
+            # file (cameraclient writes every frame to the video, but only writes a CSV
+            # row when a pose is detected) → frame f sits exactly at media time f/_fps.
+            # Do NOT subtract tl_slider.minimum(): the CSV usually starts at frame >0
+            # (the start where no pose was detected yet); subtracting would map the first
+            # frame to 0s and shift the video against the graph by exactly minimum/_fps seconds.
+            target_ms = int(f / _fps * 1000)
             player.setPosition(target_ms)
 
     def _on_slider_moved(val):
@@ -1007,11 +1070,22 @@ def launch_pyqt_viewer(session_folder: Path, report_path: Path):
 
     # Sync frame from video position during playback
     def _on_position(ms):
-        nonlocal _skip_video_cb
+        nonlocal _skip_video_cb, _playing
         if _skip_video_cb:
             _skip_video_cb = False
             return
-        f = int(ms / 1000 * _fps) + tl_slider.minimum()
+        # Inverse of _seek_frame — also does NOT add tl_slider.minimum()
+        f = int(ms / 1000 * _fps)
+        # Stop as soon as the graph runs out of data: the video usually has leftover
+        # frames at the end (the no-pose-detected part) — letting it keep going would be
+        # "the video still playing after the chart has ended".
+        if f >= tl_slider.maximum():
+            _seek_frame(tl_slider.maximum(), from_video=True)
+            if _playing:
+                player.pause()
+                btn_play.setText("▶  Play")
+                _playing = False
+            return
         f = max(tl_slider.minimum(), min(tl_slider.maximum(), f))
         if abs(f - _cur_frame) >= 1:
             _seek_frame(f, from_video=True)
@@ -1025,8 +1099,11 @@ def launch_pyqt_viewer(session_folder: Path, report_path: Path):
             btn_play.setText("▶  Play")
             _playing = False
         else:
+            # If sitting at the end of the data, jump back to the start before replaying
+            if _cur_frame >= tl_slider.maximum():
+                _seek_frame(tl_slider.minimum())
             spd = spd_multipliers[spd_box.currentIndex()]
-            player.setPlaybackRate(spd)
+            player.setPlaybackRate(spd * _rate)   # compensate declared FPS > real capture FPS
             player.play()
             btn_play.setText("⏸  Pause")
             _playing = True
@@ -1050,24 +1127,30 @@ def launch_pyqt_viewer(session_folder: Path, report_path: Path):
     def _update_speed(idx):
         spd = spd_multipliers[idx]
         if _playing:
-            player.setPlaybackRate(spd)
+            player.setPlaybackRate(spd * _rate)
 
     spd_box.currentIndexChanged.connect(_update_speed)
 
     # Toggle annotated / raw
     if btn_annot:
         def _toggle_annotated(checked):
+            nonlocal _fps, _rate
             was_playing = _playing
             if was_playing:
                 _toggle_play()
-            saved_pos = player.position()
+            # Save by FRAME, not by ms: raw_video.mp4 (written at a fixed 60fps) and
+            # annotated_video.mp4 (written at the real FPS) declare different FPS, so the
+            # same ms mark would point to 2 different frames across the 2 files.
+            saved_frame = _cur_frame
             target = annotated if checked else raw_src
+            _fps  = _probe_declared_fps(target)   # timebase changes with the file being played
+            _rate = _real_fps / _fps if _fps > 0 else 1.0
             player.setSource(QUrl.fromLocalFile(str(target.resolve())))
             player.pause()
             # Restore position after load
             def _restore_pos(status):
                 if status == QMediaPlayer.MediaStatus.LoadedMedia:
-                    player.setPosition(saved_pos)
+                    _seek_frame(saved_frame)
                     player.mediaStatusChanged.disconnect(_restore_pos)
                     if was_playing:
                         QTimer.singleShot(100, _toggle_play)
@@ -1094,21 +1177,21 @@ def launch_pyqt_viewer(session_folder: Path, report_path: Path):
     window.show()
     _seek_frame(_frames[0] if _frames else 0)
 
-    print(f"🖥️  Viewer đã mở  (annotated video: {'có' if has_annotated else 'chưa có'})")
-    print("   Đóng cửa sổ để thoát.")
+    print(f"🖥️  Viewer opened  (annotated video: {'yes' if has_annotated else 'not yet'})")
+    print("   Close the window to exit.")
     app.exec()
 
-    # Dọn file tạm
+    # Clean up temporary files
     if graphs_html_path.exists():
         graphs_html_path.unlink()
 
 
 def _reencode_to_h264(src: Path, dst: Path):
-    """Re-encode video sang H.264 (mp4v fourcc) để browser trong QWebEngineView decode được."""
-    print(f"  → Re-encode video sang H.264 cho viewer compatibility...")
+    """Re-encode the video to H.264 (mp4v fourcc) so the browser in QWebEngineView can decode it."""
+    print(f"  → Re-encoding video to H.264 for viewer compatibility...")
     cap = cv2.VideoCapture(str(src))
     if not cap.isOpened():
-        print(f"  ⚠️  Không mở được video gốc để re-encode.")
+        print(f"  ⚠️  Could not open the source video to re-encode.")
         return
 
     fps   = cap.get(cv2.CAP_PROP_FPS) or 60.0
@@ -1135,14 +1218,14 @@ def _reencode_to_h264(src: Path, dst: Path):
     print()
     cap.release()
     out.release()
-    print(f"  ✅ Re-encode xong: {dst.name}")
+    print(f"  ✅ Re-encode done: {dst.name}")
 
 
 # ──────────────────────────────────────────────────────────────────────
 # ENTRY POINT
 # ──────────────────────────────────────────────────────────────────────
 def _write_viewer_bat(session_folder: Path):
-    """Tạo Open_Viewer.bat trong session folder để double-click mở viewer."""
+    """Create Open_Viewer.bat in the session folder to open the viewer by double-clicking."""
     session_folder = Path(session_folder)
     bat_content = (
         "@echo off\n"
@@ -1152,14 +1235,14 @@ def _write_viewer_bat(session_folder: Path):
     )
     bat_path = session_folder / "Open_Viewer.bat"
     bat_path.write_text(bat_content, encoding="utf-8")
-    print(f"  → Shortcut: {bat_path.name} (double-click để mở viewer)")
+    print(f"  → Shortcut: {bat_path.name} (double-click to open the viewer)")
 
 
 def run(session_folder, open_browser=False):
-    """Được gọi từ mainpy.py sau khi stop recording."""
+    """Called from mainpy.py after recording stops."""
     session_folder = Path(session_folder)
     print(f"\n{'='*60}")
-    print(f"  XUẤT BÁO CÁO: {session_folder.name}")
+    print(f"  EXPORT REPORT: {session_folder.name}")
     print(f"{'='*60}")
     data = process_session(session_folder)
     if data is None:
@@ -1173,30 +1256,30 @@ def run(session_folder, open_browser=False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Phân tích chuyển động đập bóng & mở PyQt6 viewer",
+        description="Analyze spike motion & open the PyQt6 viewer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Ví dụ:
+Examples:
   uv run python dataprocessing.py recording/Hoang_20260612_110759
   uv run python dataprocessing.py spike.mp4
   uv run python dataprocessing.py spike.mp4 --side LEFT --complexity 2
         """
     )
     parser.add_argument("input",
-        help="Session folder (có camera_data.csv) HOẶC file video (.mp4/.avi/.mov)")
+        help="Session folder (with camera_data.csv) OR a video file (.mp4/.avi/.mov)")
     parser.add_argument("--side", default="RIGHT", choices=["RIGHT","LEFT"],
-        help="Tay phân tích khi input là video (mặc định: RIGHT)")
+        help="Which arm to analyze when the input is a video (default: RIGHT)")
     parser.add_argument("--complexity", type=int, default=1, choices=[0,1,2],
-        help="MediaPipe complexity khi input là video (mặc định: 1)")
+        help="MediaPipe complexity when the input is a video (default: 1)")
     parser.add_argument("--out", default=None,
-        help="Session folder output tùy chỉnh (chỉ dùng khi input là video)")
+        help="Custom session output folder (only used when the input is a video)")
     parser.add_argument("--no-viewer", action="store_true",
-        help="Chỉ xuất HTML, không mở cửa sổ viewer")
+        help="Only export the HTML, do not open the viewer window")
 
     args = parser.parse_args()
     path = Path(args.input)
 
-    # Input là file video → trích xuất CSV trước
+    # Input is a video file → extract the CSV first
     if path.is_file() and path.suffix.lower() in [".mp4", ".avi", ".mov", ".mkv"]:
         from datetime import datetime
         if args.out:
@@ -1208,7 +1291,7 @@ Ví dụ:
         session_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"\n{'='*60}")
-        print(f"  XỬ LÝ VIDEO: {path.name}")
+        print(f"  PROCESS VIDEO: {path.name}")
         print(f"  Session dir: {session_dir}")
         print(f"{'='*60}")
 
@@ -1222,12 +1305,12 @@ Ví dụ:
         dst = session_dir / "raw_video.mp4"
         if path.resolve() != dst.resolve():
             shutil.copy2(path, dst)
-            print(f"  → Video copy vào session folder.")
+            print(f"  → Video copied into the session folder.")
 
         path = session_dir
 
     elif not path.is_dir():
-        print(f"[LỖI] Không tìm thấy: {path}")
+        print(f"[ERROR] Not found: {path}")
         sys.exit(1)
 
     data = process_session(path)

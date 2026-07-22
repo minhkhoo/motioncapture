@@ -1,6 +1,13 @@
 # Hybrid Motion Capture System — Volleyball Spike Analysis
 
-A dual-sensor motion capture system combining an inertial measurement unit (IMU) worn on the arm with computer vision (camera + MediaPipe) to record, analyse, and visualise volleyball spike mechanics.
+A dual-sensor motion capture system combining an inertial measurement unit (IMU) worn on the arm with computer vision (camera + MediaPipe) to record, analyse, and visualise volleyball spike mechanics — and a downstream **feature-extraction and machine-learning pipeline** that turns recorded sessions into biomechanical features and a professional-vs-amateur classifier.
+
+The project has **two halves**:
+
+1. **Data collection & review** (`mainpy.py`, `cameraclient.py`, `imuclient.py`, `dataprocessing.py`) — records synchronised IMU + camera sessions and lets you review each one in a desktop viewer.
+2. **Analysis & modelling** (`extraction.py`, `src/prepare_dataset.py`, `src/promote_session.py`, `src/train_model.py`) — extracts per-spike biomechanical features and trains/evaluates a classifier.
+
+> ⚠️ **On the current results:** the dataset has only 4 players, which is far too few to draw any conclusion. The modelling pipeline is built to be **re-run when more data arrives**, not to publish accuracy. The evaluation reports its own limits bluntly (see `models/model_metrics.json` → `trustworthy: false`). A detailed file-by-file map of the analysis half lives in **`FILE_MAP.md`**.
 
 ---
 
@@ -14,7 +21,8 @@ A dual-sensor motion capture system combining an inertial measurement unit (IMU)
 6. [Module Reference](#6-module-reference)
 7. [Viewer & Analysis Charts](#7-viewer--analysis-charts)
 8. [Offline Video Analysis](#8-offline-video-analysis)
-9. [Troubleshooting](#9-troubleshooting)
+9. [Analysis & Modelling Pipeline](#9-analysis--modelling-pipeline)
+10. [Troubleshooting](#10-troubleshooting)
 
 ---
 
@@ -54,13 +62,32 @@ A dual-sensor motion capture system combining an inertial measurement unit (IMU)
              │  → Open_Viewer.bat     │
              │  → PyQt6 viewer        │
              └────────────────────────┘
+
+  ═══════════════ ANALYSIS & MODELLING HALF ═══════════════
+
+  recording/<session>/          (a good session, reviewed by eye)
+          │  src/promote_session.py   (copy + auto-update metadata)
+          ▼
+  ../Zipped data/{Amatures|Proffesionals}/<session>/   +   prepared_dataset/metadata.csv
+          │  extraction.py --root "../Zipped data"
+          ▼
+  features.csv   (one row per detected spike, 54 columns)
+          │  src/train_model.py  features.csv --metadata prepared_dataset/metadata.csv
+          ▼
+  results.csv · feature_importance.csv · models/  (joblib + feature_list + metrics)
 ```
 
-**Data flow:**
+**Data flow (collection half):**
 - IMU (100 Hz) and Camera (60 FPS) run in parallel on independent threads
 - Both use `time.perf_counter()` for PC-side timestamps → enables accurate post-hoc synchronisation
 - After `stop`: IMU flushes RAM → `imu_data.csv`; camera runs MediaPipe offline → `camera_data.csv` + `annotated_video.mp4`
 - `dataprocessing.py` reads both CSVs, fuses the data streams, and outputs an HTML report + viewer
+
+**Data flow (analysis half):**
+- `mainpy.py` writes a `session_info.json` (professional / amateur / test) into each session
+- `promote_session.py` moves a good session into the research dataset (`Zipped data`), refusing test sessions, and updates `metadata.csv` (merge, never overwrite)
+- `extraction.py` recursively scans `Zipped data`, detects the ball-contact frame per spike, segments the spike into 3 phases, and writes `features.csv`
+- `train_model.py` joins features with `metadata.csv`, splits **by player** (LeaveOneGroupOut), and evaluates a Dummy / LogisticRegression / RandomForest ladder — plus confound checks
 
 ---
 
@@ -119,10 +146,18 @@ After selecting a mode:
 ```
 === SYSTEM READY (type: start / exit) ===
 > start
+Session kind?  [1] professional   [2] amateur   [3] test
+Enter your choice (1/2/3): 1
 Enter athlete name or ID: Hoang
->>> RECORDING IN PROGRESS (type 'stop' to finish)
+>>> RECORDING DATA (type 'stop' to finish)
 > stop
 ```
+
+The **session kind** question is important for the analysis half:
+- **[1] professional / [2] amateur** → prompts for the athlete name; folder is `<name>_<timestamp>/`
+- **[3] test** → no name; folder is `TEST_<timestamp>/`, and `promote_session.py` will refuse to add it to the research dataset
+
+Either way, a `session_info.json` is written into the session folder (the source of truth used later by `promote_session.py` and `prepare_dataset.py`).
 
 The system then automatically:
 1. Stops IMU recording and flushes RAM → `imu_data.csv`
@@ -167,6 +202,7 @@ recording/
     ├── annotated_video.mp4    ← Video with skeleton overlay (mp4v codec)
     ├── camera_data.csv        ← Per-frame 3D coordinates: shoulder/elbow/wrist
     ├── imu_data.csv           ← ax,ay,az,gx,gy,gz @ 100 Hz from Arduino
+    ├── session_info.json      ← {session_kind, player_id, recorded_at} — source of truth for the analysis half
     ├── motion_report.html     ← Combined report (opened automatically by viewer)
     └── Open_Viewer.bat        ← Double-click shortcut to open viewer
 ```
@@ -249,6 +285,30 @@ Where v1 = elbow − shoulder, v2 = wrist − elbow
 - PyQt6 viewer: `QMediaPlayer` (video) + `QWebEngineView` (graphs) inside a `QSplitter`
 - `graphs_only.html`: a stripped version of the HTML with the video panel removed, served to Chromium for graph-only rendering
 
+### `extraction.py` — Feature Extraction *(analysis half, at repo root)*
+- Reads `camera_data.csv` + `imu_data.csv` per session and writes one row per detected spike to `features.csv`
+- **Contact detection (IPF)**: `IPF = local_dev(accel) × local_dev(gyro)` peaks at the ball-contact moment
+- **Phase segmentation**: splits each spike into cocking / acceleration / follow-through
+- Two IMU time axes with separate roles: `arduino_time` (monotonic, for all internal timing) vs a PC-mapped axis (only for comparing to the camera). The PC mapping uses an NTP-style lower-envelope fit.
+- Flags data-quality problems per spike: `clip_fraction`, `peak_is_clipped` (the LSM9DS1 accel hard-clips at ±4g), `contact_near_gap`, `sync_quality_ms`
+- Run: `python extraction.py --root "../Zipped data" --output features.csv --quiet`
+
+### `src/prepare_dataset.py` — Metadata Builder *(analysis half)*
+- Recursively scans `Zipped data`, copies each session's files into `prepared_dataset/` with an `attempt_id` prefix, and **merges** into `metadata.csv` (keeps hand-edited `good_recording` / `notes`, never overwrites; backs up `.bak`)
+- Skips test sessions; lists any session whose `skill_level` could not be inferred
+
+### `src/promote_session.py` — Session Promotion *(analysis half)*
+- One command to move a recorded session from `recording/` into `Zipped data/{Proffesionals|Amatures}/` and update `metadata.csv`
+- **Refuses test sessions** unless `--force`; supports `--dry-run`
+- Run: `python src/promote_session.py recording/<session>`
+
+### `src/train_model.py` — Training & Evaluation *(analysis half)*
+- Joins `features.csv` with `metadata.csv` (the **single source of truth** — only listed sessions are used)
+- Splits **by player** (LeaveOneGroupOut) so no player appears in both train and test
+- Model ladder: `DummyClassifier` → `LogisticRegression` → `RandomForest`; reports **balanced accuracy** and macro-F1, pooled across folds
+- **Confound checks**: re-predicts `session_type` with the same features, and correlates each feature with recording-quality signals — to detect whether the model is learning recording conditions instead of skill
+- Outputs: `results.csv`, `feature_importance.csv`, `models/spike_skill_model.joblib`, `models/feature_list.json`, `models/model_metrics.json`
+
 ---
 
 ## 7. Viewer & Analysis Charts
@@ -306,7 +366,39 @@ If detection rate is low (<50%), try `--complexity 2` or check lighting and came
 
 ---
 
-## 9. Troubleshooting
+## 9. Analysis & Modelling Pipeline
+
+Run every command from the `motioncapture/` folder. See **`FILE_MAP.md`** for a file-by-file map, column dictionaries, and current known issues.
+
+**Full workflow after recording a good session:**
+
+```bash
+# 1. Promote a reviewed session into the research dataset (one command)
+python src/promote_session.py recording/<session>
+#    → copies into ../Zipped data/, refuses test sessions, updates metadata.csv (merge)
+#    Then open prepared_dataset/metadata.csv and, by eye: set good_recording=no for bad
+#    sessions, fill session_type (primary/secondary) after reviewing the video, add notes.
+
+# 2. Extract features from the whole dataset (~2s for ~24 sessions)
+python extraction.py --root "../Zipped data" --output features.csv --quiet
+
+# 3. Train + evaluate (5–15s)
+python src/train_model.py features.csv --metadata prepared_dataset/metadata.csv
+
+# 4. Trace confounds across feature sets (optional, 20–40s)
+python src/train_model.py features.csv --metadata prepared_dataset/metadata.csv --compare-feature-sets
+```
+
+**Key rules:**
+- `metadata.csv` is the **single source of truth** — a session in `features.csv` that is not listed there is ignored. This is deliberate: `recording/` contains many throwaway test sessions.
+- Always use `extraction.py --root` on `Zipped data`, **not** `--all` on `recording/` (that would miss sessions that only exist in `Zipped data`).
+- `train_model.py` never mixes a player across train/test; with only 4 players it prints a **loud warning** and treats results as not reliable.
+
+**Automation status:** the mechanical steps (copy, rename, metadata update) are automated by `promote_session.py`; the **judgment** steps (reviewing video, deciding `good_recording`, rating `session_type`, writing `notes`) are intentionally left manual.
+
+---
+
+## 10. Troubleshooting
 
 | Symptom | Likely Cause | Solution |
 |---------|-------------|----------|

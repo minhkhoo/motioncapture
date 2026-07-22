@@ -16,7 +16,7 @@ class IMUClient:
         self._imu_handle = None
         self._cmd_handle = None
         
-        # SỬ DỤNG RAM ĐỂ LƯU TẠM - TRÁNH NGHẼN BĂNG THÔNG
+        # Buffer in RAM to avoid bandwidth stalls during recording
         self.ram_buffer = []
         self.csv_path = None
 
@@ -26,14 +26,14 @@ class IMUClient:
         self._thread.start()
 
     def open_session(self, session_dir):
-        # Chỉ lưu đường dẫn và dọn dẹp RAM, KHÔNG MỞ FILE I/O Ở ĐÂY
+        # Only store the path and clear RAM — do NOT open file I/O here
         self.csv_path = session_dir / "imu_data.csv"
         self.ram_buffer.clear()
 
     def close_session(self):
-        # KHI KẾT THÚC THU: Đổ toàn bộ data từ RAM vào file CSV 1 lần duy nhất
+        # END OF RECORDING: flush the entire RAM buffer to CSV in one write
         if self.csv_path is not None and len(self.ram_buffer) > 0:
-            print(f"Đang ghi {len(self.ram_buffer)} dòng IMU vào ổ cứng...")
+            print(f"Writing {len(self.ram_buffer)} IMU rows to disk...")
             with open(self.csv_path, "w", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow(["pc_time", "arduino_time", "ax", "ay", "az", "gx", "gy", "gz"])
@@ -59,41 +59,41 @@ class IMUClient:
         return fut.result(timeout=timeout)
 
     # ------------------------------------------------------------------
-    # Notification handler (ĐÃ CẬP NHẬT ĐỂ BÓC TÁCH BATCH 5 DÒNG)
+    # Notification handler (UPDATED TO UNPACK BATCHES OF 5 ROWS)
     # ------------------------------------------------------------------
 
     def handler(self, sender, data):
         if not self.collecting:
             return
 
-        # Thời điểm gói tin 140 bytes cập bến PC
+        # Moment the 140-byte packet arrives at the PC
         pc_time_arrival = time.perf_counter()
-        
-        row_size = 28 # Size của 1 dòng IMU (4 bytes int + 6 * 4 bytes float)
-        num_rows = 5  # Số lượng dòng trong 1 gói batch
-        
-        # Vòng lặp bóc tách từng dòng dữ liệu trong gói 140 bytes
+
+        row_size = 28 # Size of one IMU row (4-byte int + 6 * 4-byte float)
+        num_rows = 5  # Number of rows in one batch packet
+
+        # Unpack each data row inside the 140-byte packet
         for i in range(num_rows):
             start_idx = i * row_size
             end_idx = (i + 1) * row_size
             chunk = data[start_idx:end_idx]
-            
-            # Unpack riêng gói 28 bytes đó ra
+
+            # Unpack that individual 28-byte row
             timestamp, ax, ay, az, gx, gy, gz = struct.unpack("<I6f", chunk)
 
-            # Vì 5 dòng này được lấy mẫu cách nhau đúng 10ms (0.01s) trên Arduino
-            # Ta tính toán lại chính xác pc_time cho từng dòng dựa theo thời gian lùi dần
+            # These 5 rows were sampled exactly 10ms (0.01s) apart on the Arduino,
+            # so reconstruct each row's pc_time by counting backwards from arrival.
             row_pc_time = pc_time_arrival - (num_rows - 1 - i) * 0.010
 
             # =========================
-            # LƯU VÀO RAM 
+            # STORE IN RAM
             # =========================
             self.ram_buffer.append([
                 row_pc_time, timestamp, ax, ay, az, gx, gy, gz
             ])
 
             # =========================
-            # LIVE SHARED DATA (Đẩy liên tục để luồng camera không bị trễ)
+            # LIVE SHARED DATA (pushed continuously so the camera thread isn't delayed)
             # =========================
             shared_data.imu_buffer.append({
                 "timestamp": row_pc_time,
@@ -193,28 +193,29 @@ class IMUClient:
     # ------------------------------------------------------------------
 
     async def start_client(self):
-        """Khởi động kết nối BLE một lần duy nhất khi bật app"""
+        """Start the BLE connection once, when the app launches."""
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: self._submit(self._connect_async()))
 
     async def start_session(self):
-        """Bắt đầu thu data: Gửi lệnh START và dọn RAM"""
-        self.ram_buffer.clear() 
+        """Begin recording: send the START command and clear RAM."""
+        self.ram_buffer.clear()
         self.collecting = True
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: self._submit(self._write_cmd(b"START")))
 
     async def stop_session(self):
-        """Dừng thu data: Gửi lệnh STOP và đổ RAM ra file CSV. KHÔNG NGẮT BLE"""
+        """Stop recording: send STOP and flush RAM to CSV. Does NOT disconnect BLE."""
         self.collecting = False
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: self._submit(self._write_cmd(b"STOP")))
-        # Lưu file CSV ngay sau khi Arduino ngừng gửi
+        # Save the CSV file right after the Arduino stops streaming
         self.close_session()
 
     async def exit_client(self):
-        """Đóng hoàn toàn chương trình: Ngắt BLE và tắt thread"""
+        """Shut down completely: disconnect BLE and stop the thread."""
         self.collecting = False
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: self._submit(self._disconnect_async()))
         self._loop.call_soon_threadsafe(self._loop.stop)
+        

@@ -9,20 +9,20 @@ from pathlib import Path
 
 class CameraClient:
     def __init__(self):
-        # ĐỔI TẠI ĐÂY: Thay 0 thành 1 để nhận camera từ Irunin Webcam
-        camera_index = 1  
-        print(f"Đang kết nối Camera Irunin (Index: {camera_index})...")
-        
+        # CHANGE HERE: set to 1 to use the Iriun Webcam instead of 0
+        camera_index = 1
+        print(f"Connecting to Iriun Camera (Index: {camera_index})...")
+
         self.cap = cv2.VideoCapture(camera_index)
-        
-        # Thiết lập cấu hình chất lượng cao cho Irunin
+
+        # High-quality configuration for the Iriun camera
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         self.cap.set(cv2.CAP_PROP_FPS, 60)
-        
-        # Cơ chế dự phòng: Nếu không mở được Cam 1, tự động quay về Cam 0 của máy tính
+
+        # Fallback: if camera 1 fails to open, fall back to the machine's camera 0
         if not self.cap.isOpened():
-            print("⚠️ Không mở được Camera Irunin (Index 1). Tự động lùi về Webcam mặc định (Index 0)")
+            print("⚠️ Could not open Iriun Camera (Index 1). Falling back to default webcam (Index 0)")
             self.cap = cv2.VideoCapture(0)
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
@@ -40,7 +40,7 @@ class CameraClient:
 
     @property
     def writer(self):
-        """Đồng bộ thuộc tính với lệnh print(cam.writer) trong mainpy.py"""
+        """Kept in sync with the print(cam.writer) call in mainpy.py."""
         return self.video_writer
 
     def open_session(self, session_dir):
@@ -59,14 +59,14 @@ class CameraClient:
             actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             if actual_width == 0: actual_width, actual_height = 1280, 720
 
-        fourcc = cv2.VideoWriter_fourcc(*'XVID') 
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
         video_path = str(self.current_session_dir / "raw_video.mp4")
         self.video_writer = cv2.VideoWriter(video_path, fourcc, self.TARGET_FPS, (actual_width, actual_height))
-        
-        print(f"📹 [Camera] Đã mở file ghi thô thành công ({actual_width}x{actual_height}).")
+
+        print(f"📹 [Camera] Raw recording file opened successfully ({actual_width}x{actual_height}).")
 
     def close_session(self):
-        """Đóng session ghi hình và kích hoạt hậu kỳ AI độc lập"""
+        """Close the recording session and trigger standalone offline AI post-processing."""
         if self.ts_file:
             self.ts_file.flush()
             self.ts_file.close()
@@ -88,11 +88,11 @@ class CameraClient:
         annotated_path   = session_dir / "annotated_video.mp4"
 
         if not video_path.exists() or not ts_path.exists() or video_path.stat().st_size == 0:
-            print("⚠️ Dữ liệu video thô trống hoặc không tồn tại. Bỏ qua hậu kỳ AI.")
+            print("⚠️ Raw video data is empty or missing. Skipping AI post-processing.")
             return
 
         print("\n" + "="*60)
-        print(" KÍCH HOẠT HẬU KỲ AI TỰ ĐỘNG (OFFLINE POST-PROCESSING) ")
+        print(" RUNNING AUTOMATIC AI POST-PROCESSING (OFFLINE) ")
         print("="*60)
 
         timestamp_map = {}
@@ -115,15 +115,28 @@ class CameraClient:
 
         cap_video    = cv2.VideoCapture(str(video_path))
         total_frames = int(cap_video.get(cv2.CAP_PROP_FRAME_COUNT))
-        src_fps      = cap_video.get(cv2.CAP_PROP_FPS) or self.TARGET_FPS
         vid_w        = int(cap_video.get(cv2.CAP_PROP_FRAME_WIDTH))
         vid_h        = int(cap_video.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        # VideoWriter cho annotated output (mp4v = H.264-compatible)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        vw = cv2.VideoWriter(str(annotated_path), fourcc, src_fps, (vid_w, vid_h))
+        # TRUE FPS for annotated_video, computed from the real capture timestamps.
+        # Do NOT use TARGET_FPS (60): USB/Iriun cameras rarely reach a full 60fps,
+        # so declaring 60 makes the video play faster than real life and drift from
+        # the graph. Compute from frame-index span / time span (robust to dropped frames).
+        actual_fps = 30.0   # fallback when it can't be computed (do NOT fall back to 60)
+        if len(timestamp_map) > 1:
+            _fidx = sorted(timestamp_map)
+            _span = timestamp_map[_fidx[-1]] - timestamp_map[_fidx[0]]
+            if _span > 0:
+                _r = (_fidx[-1] - _fidx[0]) / _span
+                if 0 < _r <= 240:
+                    actual_fps = _r
+        print(f" annotated_video true FPS: {actual_fps:.1f}")
 
-        # Màu highlight cho xương tay đang theo dõi
+        # VideoWriter for the annotated output (mp4v = H.264-compatible)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        vw = cv2.VideoWriter(str(annotated_path), fourcc, actual_fps, (vid_w, vid_h))
+
+        # Highlight color for the tracked arm skeleton
         TRACKED_COLOR = (0, 229, 255)   # cyan BGR
         TRACKED_THICK = 4
 
@@ -184,7 +197,7 @@ class CameraClient:
                         cv2.circle(annotated, (px, py), r + 2, (0, 0, 0), -1)
                         cv2.circle(annotated, (px, py), r,     TRACKED_COLOR, -1)
 
-                    # Elbow angle label (inline để tránh circular import với dataprocessing)
+                    # Elbow angle label (inlined to avoid a circular import with dataprocessing)
                     def _calc_angle(a, b, c):
                         v1 = np.array(b) - np.array(a)
                         v2 = np.array(c) - np.array(b)
@@ -216,13 +229,13 @@ class CameraClient:
         pose_processor.close()
         vw.release()
         ts_path.unlink(missing_ok=True)
-        print(" ĐÃ XUẤT: camera_data.csv + annotated_video.mp4\n")
+        print(" EXPORTED: camera_data.csv + annotated_video.mp4\n")
 
     def start(self):
         self.collect_event.set()
 
     def stop(self):
-        """Chỉ hạ cờ thu thập dữ liệu, nhường việc đóng gói file cho mainpy điều phối"""
+        """Only lower the collection flag; let mainpy orchestrate the file finalization."""
         self.collect_event.clear()
 
     def shutdown(self):
