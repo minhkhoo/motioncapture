@@ -774,6 +774,9 @@ def main():
                     default="session_type",
                     help="Label for the label-based confound test (default "
                          "session_type). 'none' to skip. A single-valued label is auto-skipped.")
+    ap.add_argument("--confound-drop-unrated", action="store_true",
+                    help="Drop sessions whose session_type is still 'unrated' instead of "
+                         "stopping, so the confound test can run without rating them first.")
     ap.add_argument("--outdir", default=".", help="Output directory")
     args = ap.parse_args()
 
@@ -802,6 +805,33 @@ def main():
 
     df = quality_report(df, args.exclude_low_quality)
     guard_dataset(df, "after quality filtering")
+
+    # ── Unrated-session guard for the confound test ──────────────────
+    # The confound test predicts session_type; rows still marked 'unrated' cannot be
+    # part of that. Require them rated first (or explicitly dropped). Only enforced
+    # when session_type is actually used as a confound (compare mode, or the default
+    # --confound-label session_type).
+    uses_st_confound = args.compare_feature_sets or args.confound_label == "session_type"
+    if uses_st_confound and "session_type" in df.columns:
+        unrated_mask = df["session_type"].astype(str) == "unrated"
+        if unrated_mask.any():
+            unrated_sessions = sorted(df.loc[unrated_mask, "session_name"].unique())
+            if args.confound_drop_unrated:
+                df = df[~unrated_mask].copy()
+                print(f"\n[--confound-drop-unrated] Dropped {len(unrated_sessions)} unrated "
+                      f"session(s) ({int(unrated_mask.sum())} contacts) from the run.")
+                guard_dataset(df, "after dropping unrated sessions")
+            else:
+                hr("STOP — UNRATED SESSIONS")
+                print(f"  {len(unrated_sessions)} session(s) not yet rated primary/secondary. "
+                      "Fill in the")
+                print("  session_type column in metadata.csv before running the confound test,")
+                print("  or use --confound-label none to skip this test.")
+                print("  (Or use --confound-drop-unrated to drop them and run right away.)")
+                print(f"\n  Unrated sessions ({len(unrated_sessions)}):")
+                for s in unrated_sessions:
+                    print(f"     - {s}")
+                sys.exit(1)
 
     n_players = df["player_id"].nunique()
     if n_players < MIN_PLAYERS_TRUST:
