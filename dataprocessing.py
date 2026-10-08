@@ -13,8 +13,8 @@ Can be used in 2 ways:
 Options (only used when the input is a video file):
   --side        RIGHT | LEFT  (default: RIGHT)
   --complexity  0 | 1 | 2    (default: 1)
-  --out         <folder>      custom session output folder
-"""
+  -  -out         <folder>      custom session output folder
+"""  
 
 import argparse
 import csv
@@ -140,7 +140,7 @@ def extract_pose_from_video(
                 lm  = results.pose_landmarks.landmark
                 s, e, wr_ = lm[SHOULDER], lm[ELBOW], lm[WRIST]
 
-                # Ghi CSV
+                # Write CSV row
                 writer.writerow([
                     fidx, ts,
                     s.x, s.y, s.z, s.visibility,
@@ -232,9 +232,21 @@ def process_session(session_folder: Path) -> dict | None:
         return None
 
     print("  → Reading camera_data.csv ...")
-    df = pd.read_csv(csv_path)
+    df_raw = pd.read_csv(csv_path)
+    
+    # Safely drop rows with a failed pose or a bad timestamp before computing the charts.
+    # reset_index is REQUIRED: after dropna the original index has gaps, but accel[idx]/cam_ts[idx]
+    # below index by POSITION 0..len-1 -> without a reset an IndexError occurs when NaN rows are dropped.
+    df = df_raw.dropna(subset=["timestamp", "shoulder_x"]).reset_index(drop=True)
+    if df.empty:
+        print("  ⚠️ No valid data frames found after filtering NaNs.")
+        return None
+
     cam_ts = df["timestamp"].values
     frames = df["frame"].values.astype(int)
+
+    # IMU fusion
+    accel = np.zeros(len(df))
 
     # IMU fusion
     accel = np.zeros(len(df))
@@ -481,9 +493,9 @@ kbd{{background:var(--card);border:1px solid var(--border);border-radius:3px;
     </div>
     <div class="ctrl-area">
       <div class="finfo">
-        <span>Frame <span class="fval" id="dF">—</span></span>
+        <span class="tval">t = <span id="dT">0.000s</span></span>
         <span class="aval" id="dA">—°</span>
-        <span class="tval" id="dT">0.000s</span>
+        <span>CSV row <span class="fval" id="dF">—</span></span>
       </div>
       <input type="range" id="slider" min="0" max="0" value="0" step="1">
       <div class="ctrls">
@@ -1039,8 +1051,11 @@ def launch_pyqt_viewer(session_folder: Path, report_path: Path):
             return
         ang = fd['angle']
         toff = fd['time_offset']
+        # Lead with the timestamp — it is the shared anchor for cross-referencing with
+        # extraction.py. 'CSV row' is a row index, NOT the video frame (the camera_data.csv
+        # 'frame' column is renumbered/inconsistent across sessions).
         info_bar.setText(
-            f"Frame {f}  |  {ang:.1f}°  |  {toff:.3f}s"
+            f"t = {toff:.3f}s   |   CSV row {f}   |   {ang:.1f}°"
         )
         # Sync cursor in graph via JS
         view.page().runJavaScript(f"seek({f});")
