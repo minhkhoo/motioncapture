@@ -7,7 +7,7 @@ Merges two kinds of columns into ONE file, `data_tracking.xlsx`:
   • [AUTO]   — quality re-scored by code on every run: imu_verdict
                (NO when the IMU file is missing / dead baseline / loss > threshold), freq,
                loss, stalls, clip, accel/gyro peaks, fps, gap, detect, sync, overlap,
-               van_de_that (issues), skill_level + session_type (from the Zipped path /
+               actual_issues, skill_level + session_type (from the Zipped path /
                session_info.json).
   • [MANUAL] — filled in by hand; the script NEVER overwrites them: contact_ts,
                landed_ts, good_recording, quality_star, notes.
@@ -21,8 +21,7 @@ Run:
 After running: updates `data_tracking.xlsx` (manual columns preserved) and writes
 `manual_contacts.csv` (read by extraction.py).
 
-NOTE: the imu_verdict / sync_cam_first / van_de_that values keep their original
-Vietnamese codes ("CÓ" = yes, "KHÔNG ..." = no) because downstream scripts parse them.
+imu_verdict is "yes" or "no (reason)"; sync_cam_first is "yes" or "no".
 """
 import os, re, json, warnings
 from pathlib import Path
@@ -81,7 +80,7 @@ def quality_metrics(folder: Path) -> dict:
                      pass1=int(vc.get(1, 0)), pass2=int(vc.get(2, 0)), pass0=int(vc.get(0, 0)))
     except Exception:
         r.update(cam_fps=0, cam_median_gap_ms=np.nan, cam_max_gap_ms=np.nan,
-                 detect_pct=np.nan, detect_frames="lỗi", pass1=0, pass2=0, pass0=0)
+                 detect_pct=np.nan, detect_frames="error", pass1=0, pass2=0, pass0=0)
     # video frame count (catches empty videos)
     r["video_frames"] = np.nan
     try:
@@ -98,7 +97,7 @@ def quality_metrics(folder: Path) -> dict:
                   "lost_small", "accel_range_G", "accel_clip_pct", "accel_peak_G",
                   "gyro_clip_pct", "gyro_peak_dps"):
             r[k] = np.nan
-        r["imu_verdict"] = "KHÔNG (thiếu file)"
+        r["imu_verdict"] = "no (missing file)"
     else:
         di = pd.read_csv(imup)
         at = di["arduino_time"].values.astype(np.int64) / 1e6; at = at - at[0]
@@ -120,11 +119,11 @@ def quality_metrics(folder: Path) -> dict:
         # changes across firmware versions (Part C1 audit: no .ino calls setGyroFS).
         gclip = 100 * ((np.abs(di["gx"]) >= 1999.0) | (np.abs(di["gy"]) >= 1999.0) | (np.abs(di["gz"]) >= 1999.0)).sum() / len(di)
         if not alive:
-            verdict = "KHÔNG (chết-baseline)"
+            verdict = "no (dead baseline)"
         elif loss > LOSS_DEAD:
-            verdict = f"KHÔNG (loss {loss:.0f}%>{LOSS_DEAD})"
+            verdict = f"no (loss {loss:.0f}%>{LOSS_DEAD})"
         else:
-            verdict = "CÓ"
+            verdict = "yes"
         r.update(imu_freq_hz=round(freq, 1), imu_stalls=int(len(stalls)), imu_max_stall_ms=round(maxstall),
                  imu_loss_pct=round(loss), lost_stall=lost_stall, lost_small=lost_small,
                  accel_range_G=rng, accel_clip_pct=round(clip, 1), accel_peak_G=round(accpk, 1),
@@ -134,33 +133,33 @@ def quality_metrics(folder: Path) -> dict:
         di = pd.read_csv(imup); pc = di["pc_time"].dropna().values
         ts = pd.read_csv(camp)["timestamp"].dropna().values
         cf = bool(ts.min() < pc.min())
-        r["sync_cam_first"] = "CÓ" if cf else "KHÔNG"
+        r["sync_cam_first"] = "yes" if cf else "no"
         r["sync_delay_s"] = round(abs(float(ts.min() - pc.min())), 2)
         r["overlap_pct"] = round(100 * (min(ts.max(), pc.max()) - max(ts.min(), pc.min())) / (ts.max() - ts.min()))
     else:
         r.update(sync_cam_first="—", sync_delay_s=np.nan, overlap_pct=np.nan)
     # ---- REAL ISSUES (low detect is ignored: athlete left the frame, not a fault) ----
     p = []
-    if not str(r["imu_verdict"]).startswith("CÓ"):
-        p.append(r["imu_verdict"].replace("KHÔNG ", ""))
+    if not str(r["imu_verdict"]).startswith("yes"):
+        p.append(r["imu_verdict"].replace("no ", "", 1))
     lv = r.get("imu_loss_pct")
     if lv == lv and lv is not None and 20 < lv <= LOSS_DEAD:
         p.append(f"loss {lv}%")
     ms = r.get("imu_max_stall_ms")
     if ms == ms and ms is not None and ms >= 500:
-        p.append(f"treo {ms:.0f}ms")
+        p.append(f"stall {ms:.0f}ms")
     cl = r.get("accel_clip_pct")
     if cl == cl and cl is not None and cl > 5:
         p.append(f"clip {cl}%")
     ov = r.get("overlap_pct")
     if ov == ov and ov is not None and ov < 70:
         p.append(f"overlap {ov}%")
-    if r.get("sync_cam_first") == "KHÔNG":
-        p.append("IMU-trước-camera")
+    if r.get("sync_cam_first") == "no":
+        p.append("imu-before-camera")
     vf = r.get("video_frames")
     if vf == vf and vf is not None and vf < 5:
-        p.append("video rỗng")
-    r["van_de_that"] = "; ".join(p) if p else "OK"
+        p.append("empty video")
+    r["actual_issues"] = "; ".join(p) if p else "OK"
     return r
 
 
@@ -361,7 +360,7 @@ def main():
             "lost_stall", "lost_small", "accel_range_G", "accel_clip_pct", "accel_peak_G",
             "gyro_clip_pct", "gyro_peak_dps", "cam_fps", "cam_median_gap_ms", "cam_max_gap_ms",
             "video_frames", "detect_pct", "detect_frames", "pass1", "pass2", "pass0",
-            "sync_cam_first", "sync_delay_s", "overlap_pct", "van_de_that"]
+            "sync_cam_first", "sync_delay_s", "overlap_pct", "actual_issues"]
     cols = ident + MANUAL_COLS + auto
     df = pd.DataFrame(rows)[cols].sort_values(["source", "player_id", "session_name"])
 
