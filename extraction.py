@@ -1,9 +1,14 @@
 """
 feature_extraction.py — Biomechanical Feature Extraction Pipeline
 ==================================================================
-Step 1: Automatically detect the contact frame (ball-contact moment) via IPF
-Step 2: Segment the spike into 3 phases (Cocking / Acceleration / Follow-through)
-Step 3: Extract features from each phase
+Step 1: Locate the ball-contact frame. Default = IPF auto-detection (legacy). Migration
+        in progress toward hand-marked contacts read from contacts.csv (Coleman et al.
+        1993); once that lands, IPF moves behind --use-ipf.
+Step 2: Find the two events that bound the ACCELERATION phase — max elbow extension
+        (within [contact − 1.5s, contact]) and contact. (Simplified from the old
+        4-boundary / 3-phase version, whose cocking-start and follow-through-end
+        boundaries were arbitrary thresholds.)
+Step 3: Extract the curated features — 13 model-inputs + QC/identifier columns.
 
 Input:  One or more session folders containing camera_data.csv + imu_data.csv
 Output: features.csv — one row per contact, columns = features
@@ -37,26 +42,37 @@ warnings.filterwarnings("ignore")
 # CONFIG
 # ──────────────────────────────────────────────────────────────────────
 
-# EMA smoothing (same as dataprocessing.py for consistency)
-SMOOTH_SH = 0.85
-SMOOTH_EL = 0.50
-SMOOTH_WR = 0.30
+# Camera coordinate smoothing: Savitzky-Golay filter (~0.1s window, polyorder 2).
+# Replaced EMA (which had initialization bias from the first frame, phase lag
+# proportional to α, and fps-dependent behavior) — see _compute_kinematics.
+CAM_SAVGOL_WINDOW_S = 0.10   # seconds — same as the IMU Savgol window
 
-# IPF detection
+# IPF detection (legacy contact detector — kept for --use-ipf comparison only)
 IPF_WINDOW     = 5    # samples per side for the local deviation (~50ms at 100Hz)
 MIN_PEAK_DIST  = 50   # min distance between 2 peaks (500ms) — avoid detecting one spike twice
-GYRO_THRESHOLD_STD = 1.5  # number of std above the mean to detect the start of the cocking phase
 
-# Phase boundaries (measured from the contact frame, in SECONDS — converted to a
-# sample count using each session's actual sample rate, because the IMU BLE link
-# drops packets so the rate varies 22-68Hz instead of a fixed 100Hz)
-PRE_CONTACT_WINDOW_S  = 1.5  # seconds before contact = cocking + acceleration
-POST_CONTACT_WINDOW_S = 1.0  # seconds after contact = follow-through
+# Analysis windows around the contact frame, in SECONDS. PRE also bounds the camera
+# search for the max-extension event; both bound the IMU feature window around contact.
+# (Converted to sample/frame counts per session — the IMU BLE link drops packets so the
+# rate varies 22-68Hz instead of a fixed 100Hz.)
+PRE_CONTACT_WINDOW_S  = 1.5  # seconds before contact
+POST_CONTACT_WINDOW_S = 1.0  # seconds after contact (IMU peak/impulse window only)
 
 # ── Sensor limits (LSM9DS1 via the Arduino_LSM9DS1 library) ─────────
-# CTRL_REG6_XL = 0x70 → ±4g per axis, the range CANNOT be changed via the library.
-# Saturated samples are "clamped" at 4.0 → magnitude ceiling = sqrt(3)*4 = 6.93G.
-ACC_CLIP_THRESHOLD_G = 3.99
+# Legacy firmware: CTRL_REG6_XL = 0x70 → ±4g per axis, saturates at 4.0 (magnitude
+# ceiling sqrt(3)*4 = 6.93G). New firmware reconfigures to ±8g → saturates at 8.0.
+# The right clip threshold per session is chosen from accel_range (see load_session).
+ACC_CLIP_THRESHOLD_G_4G  = 3.99   # ±4g firmware (legacy sessions)
+ACC_CLIP_THRESHOLD_G_8G  = 7.99   # ±8g firmware (newer sessions)
+ACC_CLIP_THRESHOLD_G_24G = 23.99  # ±24g firmware (newest sessions, setAccelFS(1))
+ACC_CLIP_THRESHOLD_G     = ACC_CLIP_THRESHOLD_G_4G   # back-compat default (±4g)
+
+# Gyro never has its range changed by firmware (Part C1 audit: no .ino ever calls
+# setGyroFS) -- always the LSM9DS1 library default +-2000 dps. Per-axis, matching
+# the accel clip check below (checking the combined magnitude >=2000 overcounts:
+# three axes at ~1200 dps each already give a magnitude over 2000 with no single
+# axis anywhere near its real ceiling).
+GYRO_CLIP_THRESHOLD_DPS = 1999.0
 
 # Gap detection: arduino_time spacing above this threshold = a dropped BLE packet
 IMU_GAP_THRESHOLD_S    = 0.050   # gap > 50ms
@@ -178,18 +194,52 @@ def _jerk_stats(sig: np.ndarray, t: np.ndarray, prefix: str) -> dict:
     return out
 
 
-def _jerk_rms_only(sig: np.ndarray, t: np.ndarray) -> float:
-    """RMS jerk for a short segment (used per phase). NaN if it can't be computed."""
-    if sig is None or t is None or len(sig) < 3 or len(t) != len(sig):
-        return np.nan
-    if not np.all(np.diff(t) > 0):
-        return np.nan
-    return float(np.sqrt(np.mean(np.gradient(sig, t) ** 2)))
-
-
 # ──────────────────────────────────────────────────────────────────────
 # STEP A: READ AND PREPARE THE DATA
 # ──────────────────────────────────────────────────────────────────────
+
+def _probe_video_fps(session_folder: Path) -> float | None:
+    """Declared FPS of the session's video, for the timestamp→video-frame estimate.
+
+    Only used for the human-readable contact report (NOT for feature values).
+    Returns None if there is no video or it can't be read.
+    """
+    import cv2  # local import — feature extraction itself doesn't need OpenCV
+    for name in ("annotated_video.mp4", "raw_video.mp4"):
+        vp = session_folder / name
+        if vp.exists():
+            cap = cv2.VideoCapture(str(vp))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            cap.release()
+            if fps and 0 < fps <= 240:
+                return float(fps)
+    return None
+
+
+def _detect_accel_range(session_folder: Path, axes: np.ndarray) -> int:
+    """Accelerometer full-scale range in ±g (4, 8 or 24) for a session.
+
+    Priority:
+      1. 'accel_range' in session_info.json, if present (4, 8 or 24) — declare it there
+         to be certain.
+      2. Auto-detect from the largest observed sample: >8.05g proves it is not the ±8g
+         build (which saturates at 8.0) → ±24g; >4.05g proves it is not the ±4g build
+         (saturates at 4.0) → ±8g; otherwise default to 4 (legacy). A higher-range
+         session that never exceeded a lower ceiling is reported as the lower range,
+         which is harmless — with no sample near either ceiling, no clip is flagged.
+    """
+    info_path = session_folder / "session_info.json"
+    if info_path.exists():
+        try:
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+            r = info.get("accel_range")
+            if r in (4, 8, 24, "4", "8", "24"):
+                return int(r)
+        except Exception:
+            pass
+    mx = float(np.nanmax(np.abs(axes)))
+    return 24 if mx > 8.05 else (8 if mx > 4.05 else 4)
+
 
 def load_session(session_folder: Path, force_camera_only: bool = False) -> dict | None:
     """
@@ -214,17 +264,31 @@ def load_session(session_folder: Path, force_camera_only: bool = False) -> dict 
         print(f"  [WARN] No imu_data.csv — using camera features only")
 
     # --- Camera data ---
-    df_cam = pd.read_csv(cam_path)
+    try:
+        df_cam = pd.read_csv(cam_path)
+    except pd.errors.EmptyDataError:
+        print(f"  [SKIP] Empty camera_data.csv: {session_folder.name}")
+        return None
+
+    # Drop NaN rows (undetected poses) before computing — they are kept in the CSV file
+    # but cannot be used for kinematics. Savgol filter requires contiguous valid data.
+    n_before = len(df_cam)
+    df_cam = df_cam.dropna(subset=["timestamp", "shoulder_x"]).reset_index(drop=True)
+    n_dropped = n_before - len(df_cam)
+    if n_dropped > 0:
+        print(f"  [INFO] Dropped {n_dropped}/{n_before} NaN rows (pose not detected / missing timestamp) "
+              f"for the calculation, kept in the file: {session_folder.name}")
+
     if len(df_cam) < 30:
-        print(f"  [SKIP] Camera data too short ({len(df_cam)} rows): {session_folder.name}")
+        print(f"  [SKIP] Camera data too short ({len(df_cam)} valid rows): {session_folder.name}")
         return None
 
     cam_ts = df_cam["timestamp"].values
     cam_fps = 1.0 / np.median(np.diff(cam_ts)) if len(cam_ts) > 1 else 60.0
     cam_fps = float(np.clip(cam_fps, 20, 120))
 
-    # EMA filter on the camera coordinates (same as dataprocessing.py)
-    elbow_angles, wrist_positions, arm_length = _compute_kinematics(df_cam)
+    # Savgol filter on the camera coordinates (symmetric, no phase lag)
+    elbow_angles, wrist_positions, arm_length = _compute_kinematics(df_cam, cam_fps)
 
     # MediaPipe visibility (0–1) — a DATA QUALITY indicator, not a technique feature
     # (see the warning in the extract_features docstring). Falls back to NaN if an
@@ -285,12 +349,31 @@ def load_session(session_folder: Path, force_camera_only: bool = False) -> dict 
             imu_acc   = np.sqrt(df_imu["ax"]**2 + df_imu["ay"]**2 + df_imu["az"]**2).values
             imu_gyro  = np.sqrt(df_imu["gx"]**2 + df_imu["gy"]**2 + df_imu["gz"]**2).values
 
-            # ── CLIPPING (FIX 3) ─────────────────────────────────────────
-            # The LSM9DS1 accel hard-clips at ±4g PER AXIS → check each axis, not the
-            # magnitude (the magnitude can be <6.93 while an axis is already clipped).
+            # ── ACCEL RANGE + CLIPPING ───────────────────────────────────
+            # The LSM9DS1 accel hard-clips PER AXIS (check each axis, not the magnitude:
+            # the magnitude can be < ceiling while one axis is already clipped). Firmware
+            # range = ±4g (clip 3.99), ±8g (clip 7.99) or ±24g (clip 23.9). accel_range
+            # decides which threshold to use AND tells train_model.py whose imu_peak_acc_g
+            # is trustworthy (a lower-range session compresses hard spikes to the ceiling).
             axes = df_imu[["ax", "ay", "az"]].values
-            imu_clip_mask = (np.abs(axes) >= ACC_CLIP_THRESHOLD_G).any(axis=1)
+            accel_range = _detect_accel_range(session_folder, axes)
+            if accel_range == 24:
+                clip_thresh = ACC_CLIP_THRESHOLD_G_24G
+            elif accel_range == 8:
+                clip_thresh = ACC_CLIP_THRESHOLD_G_8G
+            else:
+                clip_thresh = ACC_CLIP_THRESHOLD_G_4G
+            imu_clip_mask = (np.abs(axes) >= clip_thresh).any(axis=1)
             clip_fraction = float(imu_clip_mask.mean())
+
+            # ── GYRO CLIPPING (per-axis, Part C2) ─────────────────────────
+            # Checking the combined magnitude >=2000 overcounts: three axes at
+            # ~1200 dps each already produce a magnitude over 2000 with no
+            # single axis anywhere near its real ±2000 dps ceiling. Per-axis
+            # avoids that false positive (same reasoning as the accel check).
+            gyro_axes = df_imu[["gx", "gy", "gz"]].values
+            gyro_clip_mask = (np.abs(gyro_axes) >= GYRO_CLIP_THRESHOLD_DPS).any(axis=1)
+            gyro_clip_fraction = float(gyro_clip_mask.mean())
 
             # Average sample rate, computed on the monotonic axis (arduino_time)
             imu_duration = imu_t[-1] - imu_t[0]
@@ -320,6 +403,7 @@ def load_session(session_folder: Path, force_camera_only: bool = False) -> dict 
         "session_name": session_folder.name,
         "cam_ts":       cam_ts,
         "cam_fps":      cam_fps,
+        "video_fps":    _probe_video_fps(session_folder),
         "elbow_angles": elbow_angles,
         "wrist_positions": wrist_positions,
         "arm_length":   arm_length,
@@ -334,6 +418,9 @@ def load_session(session_folder: Path, force_camera_only: bool = False) -> dict 
         "sync_lowlat_fraction": sync_lowlat_fraction if has_imu else None,
         "imu_clip_mask":  imu_clip_mask if has_imu else None,
         "clip_fraction":  clip_fraction if has_imu else None,
+        "gyro_clip_mask":     gyro_clip_mask     if has_imu else None,
+        "gyro_clip_fraction": gyro_clip_fraction if has_imu else None,
+        "accel_range":    accel_range   if has_imu else np.nan,
         "n_contacts_rejected": 0,
         "imu_sample_rate": imu_sample_rate if has_imu else None,
         "imu_acc":      imu_acc_smooth  if has_imu else None,
@@ -343,58 +430,58 @@ def load_session(session_folder: Path, force_camera_only: bool = False) -> dict 
     }
 
 
-def _compute_kinematics(df_cam: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, float]:
-    """EMA filter + elbow-angle computation for the whole session.
+def _compute_kinematics(df_cam: pd.DataFrame, cam_fps: float = 60.0) -> tuple[np.ndarray, np.ndarray, float]:
+    """Savgol-smoothed elbow-angle and wrist-position computation.
+
+    Replaced EMA (which seeded from the first frame and accumulated state):
+    - No initialization bias: Savgol is a symmetric, non-causal FIR filter.
+    - No phase lag: the smoothed value is centered, not delayed.
+    - FPS-independent: window set in seconds, converted to frames internally.
 
     Returns 3 things:
-    - angles:          (N,)   elbow angle per frame (unchanged from before)
-    - wrist_positions: (N,3)  wrist coordinates relative to the shoulder (wr_rel) after EMA
-    - arm_length:      scalar median shoulder→elbow distance over the session,
-                       used as the "measuring unit" to normalize the wrist-position features.
-                       Median (not mean) to be robust to noisy frames.
+    - angles:          (N,)   elbow angle per frame
+    - wrist_positions: (N,3)  wrist coordinates relative to the shoulder
+    - arm_length:      scalar median shoulder→elbow distance (robust normalizer)
     """
-    sh_x = sh_y = sh_z = None
-    el_x = el_y = el_z = None
-    wr_x = wr_y = wr_z = None
-    angles = []
-    wrist_positions = []
-    se_dists = []  # shoulder→elbow distance per frame
+    sh = np.column_stack([ df_cam["shoulder_x"].values,
+                          -df_cam["shoulder_y"].values,
+                          -df_cam["shoulder_z"].values])
+    el = np.column_stack([ df_cam["elbow_x"].values,
+                          -df_cam["elbow_y"].values,
+                          -df_cam["elbow_z"].values])
+    wr = np.column_stack([ df_cam["wrist_x"].values,
+                          -df_cam["wrist_y"].values,
+                          -df_cam["wrist_z"].values])
 
-    for _, row in df_cam.iterrows():
-        raw = [
-            [ row["shoulder_x"], -row["shoulder_y"], -row["shoulder_z"]],
-            [ row["elbow_x"],    -row["elbow_y"],    -row["elbow_z"]],
-            [ row["wrist_x"],    -row["wrist_y"],    -row["wrist_z"]],
-        ]
-        if sh_x is None:
-            sh_x, sh_y, sh_z = raw[0]
-            el_x, el_y, el_z = raw[1]
-            wr_x, wr_y, wr_z = raw[2]
+    n = len(sh)
 
-        sh_x = SMOOTH_SH*sh_x + (1-SMOOTH_SH)*raw[0][0]
-        sh_y = SMOOTH_SH*sh_y + (1-SMOOTH_SH)*raw[0][1]
-        sh_z = SMOOTH_SH*sh_z + (1-SMOOTH_SH)*raw[0][2]
-        el_x = SMOOTH_EL*el_x + (1-SMOOTH_EL)*raw[1][0]
-        el_y = SMOOTH_EL*el_y + (1-SMOOTH_EL)*raw[1][1]
-        el_z = SMOOTH_EL*el_z + (1-SMOOTH_EL)*raw[1][2]
-        wr_x = SMOOTH_WR*wr_x + (1-SMOOTH_WR)*raw[2][0]
-        wr_y = SMOOTH_WR*wr_y + (1-SMOOTH_WR)*raw[2][1]
-        wr_z = SMOOTH_WR*wr_z + (1-SMOOTH_WR)*raw[2][2]
+    # Savgol window: ~0.1s, min 5, always odd, capped at array length
+    win = max(int(round(cam_fps * CAM_SAVGOL_WINDOW_S)), 5)
+    if win % 2 == 0:
+        win += 1
+    if win > n:
+        win = n if n % 2 == 1 else max(n - 1, 5)
 
-        el_rel = np.array([el_x - sh_x, el_y - sh_y, el_z - sh_z])
-        wr_rel = np.array([wr_x - sh_x, wr_y - sh_y, wr_z - sh_z])
+    if n >= win >= 5:
+        for coords in (sh, el, wr):
+            for j in range(3):
+                coords[:, j] = savgol_filter(coords[:, j], window_length=win, polyorder=2)
 
-        v1 = el_rel
-        v2 = wr_rel - el_rel
-        cos_a = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
-        angle = 180 - np.degrees(np.arccos(np.clip(cos_a, -1.0, 1.0)))
-        angles.append(float(angle))
+    # Relative vectors
+    el_rel = el - sh          # shoulder → elbow
+    wr_rel = wr - sh          # shoulder → wrist
 
-        wrist_positions.append(wr_rel)
-        se_dists.append(float(np.linalg.norm(el_rel)))  # |shoulder→elbow|
+    # Elbow angle: 180 − arccos(v1·v2 / |v1||v2|)
+    v1 = el_rel               # upper arm
+    v2 = wr_rel - el_rel      # forearm
+    dot = np.sum(v1 * v2, axis=1)
+    n1 = np.linalg.norm(v1, axis=1)
+    n2 = np.linalg.norm(v2, axis=1)
+    cos_a = dot / (n1 * n2 + 1e-6)
+    angles = 180.0 - np.degrees(np.arccos(np.clip(cos_a, -1.0, 1.0)))
 
-    arm_length = float(np.median(se_dists)) if len(se_dists) > 0 else np.nan
-    return np.array(angles), np.array(wrist_positions), arm_length
+    arm_length = float(np.median(n1)) if n > 0 else np.nan
+    return angles, wr_rel, arm_length
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -528,99 +615,44 @@ def _detect_contacts_camera_only(data: dict) -> list[dict]:
 
 def segment_phases(data: dict, contact: dict) -> dict | None:
     """
-    Split the spike into 3 phases based on the contact frame.
+    Locate the TWO events that bound the ACCELERATION phase of the spike.
 
-    Phase 1 — ARM COCKING:
-        Start: gyro exceeds the threshold (= mean + 1.5 std)
-        End:   elbow angle reaches its maximum in the pre-contact window
+    Simplified from the old 4-boundary version, which relied on two arbitrary
+    thresholds now removed: cocking-start (gyro > mean + 1.5·SD) and
+    follow-through-end (a fixed post-contact window). Only signal-derived events remain:
 
-    Phase 2 — ARM ACCELERATION:
-        Start: end of Phase 1
-        End:   contact frame (peak IPF)
+      • max_extension : elbow angle is largest (arm cocked furthest back) within
+                        [contact − PRE_CONTACT_WINDOW_S, contact]  ← the one correct
+                        boundary kept from the old version.
+      • contact       : the detected / hand-marked ball-contact frame.
 
-    Phase 3 — FOLLOW-THROUGH:
-        Start: contact frame
-        End:   gyro returns to baseline (or a fixed window)
-
-    Returns a dict of the indices and timestamps of each phase boundary.
+    ACCELERATION phase = [max_extension → contact]. Returns their camera-frame indices,
+    timestamps, and the phase duration; None if there aren't enough pre-contact frames.
     """
-    cam_ts    = data["cam_ts"]
-    angles    = data["elbow_angles"]
-    n_cam     = len(angles)
+    cam_ts      = data["cam_ts"]
+    angles      = data["elbow_angles"]
+    cam_fps     = data["cam_fps"]
     contact_cam = contact["cam_frame_idx"]
 
-    # Analysis window converted directly from seconds to camera frames (using the
-    # session's own cam_fps, unrelated to the IMU sample rate)
-    cam_fps   = data["cam_fps"]
+    # Pre-contact search window in camera frames (session's own cam_fps)
     pre_window_cam = int(PRE_CONTACT_WINDOW_S * cam_fps)
-    post_window_cam = int(POST_CONTACT_WINDOW_S * cam_fps)
-
-    # Indices in camera space
-    window_start = max(0, contact_cam - pre_window_cam)
-    window_end   = min(n_cam - 1, contact_cam + post_window_cam)
-
+    window_start   = max(0, contact_cam - pre_window_cam)
     if window_start >= contact_cam:
         return None
 
-    # ── Phase 1/2 boundary: elbow angle reaches its max in the pre-contact window ──
-    # This is the "arm cocked" point — the elbow furthest back before the swing
     pre_angles = angles[window_start:contact_cam]
     if len(pre_angles) == 0:
         return None
 
-    # Max angle in the pre-contact window
-    max_angle_local_idx = int(np.argmax(pre_angles))
-    cocking_end_cam = window_start + max_angle_local_idx
-
-    # ── Phase 1 start: when movement begins (gyro exceeds the threshold) ──
-    if data["has_imu"]:
-        gyro = data["imu_gyro"]
-        imu_ts = data["imu_ts"]
-        baseline_gyro = np.mean(gyro[:15])
-        std_gyro      = np.std(gyro[:15])
-        threshold_gyro = baseline_gyro + GYRO_THRESHOLD_STD * std_gyro
-
-        # Find the IMU point before contact where gyro exceeds the threshold.
-        # Cut the window by REAL TIME on the arduino axis (searchsorted) instead of
-        # seconds × average_sample_rate: the average sample rate is dragged down by
-        # dropped-packet gaps, while locally the sensor still runs ~100Hz.
-        imu_t = data["imu_t"]
-        contact_imu = contact["imu_idx"]
-        pre_imu_start = int(np.searchsorted(
-            imu_t, imu_t[contact_imu] - PRE_CONTACT_WINDOW_S, side="left"))
-        pre_imu_start = max(0, min(pre_imu_start, contact_imu))
-        gyro_pre = gyro[pre_imu_start:contact_imu]
-
-        # Find the first time gyro exceeds the threshold
-        above_threshold = np.where(gyro_pre > threshold_gyro)[0]
-        if len(above_threshold) > 0:
-            cocking_start_imu = pre_imu_start + above_threshold[0]
-            cocking_start_ts  = imu_ts[cocking_start_imu]
-            cocking_start_cam = int(np.argmin(np.abs(cam_ts - cocking_start_ts)))
-        else:
-            cocking_start_cam = window_start
-    else:
-        cocking_start_cam = window_start
-
-    # ── Phase 3 end: signal returns to baseline after contact ──
-    followthrough_end_cam = window_end  # default: fixed window
+    # Event 1: max elbow extension (arm cocked furthest back) in the pre-contact window
+    max_extension_cam = window_start + int(np.argmax(pre_angles))
 
     return {
-        # Camera frame indices
-        "cocking_start_cam":    int(max(0, cocking_start_cam)),
-        "cocking_end_cam":      int(cocking_end_cam),
-        "acceleration_end_cam": int(contact_cam),
-        "followthrough_end_cam": int(followthrough_end_cam),
-
-        # Timestamps
-        "cocking_start_ts":    float(cam_ts[max(0, cocking_start_cam)]),
-        "contact_ts":          float(contact["contact_ts"]),
-        "followthrough_end_ts": float(cam_ts[followthrough_end_cam]),
-
-        # Phase durations (seconds)
-        "cocking_duration_s":       float(cam_ts[cocking_end_cam] - cam_ts[max(0, cocking_start_cam)]),
-        "acceleration_duration_s":  float(cam_ts[contact_cam] - cam_ts[cocking_end_cam]),
-        "followthrough_duration_s": float(cam_ts[followthrough_end_cam] - cam_ts[contact_cam]),
+        "max_extension_cam": int(max_extension_cam),
+        "contact_cam":       int(contact_cam),
+        "max_extension_ts":  float(cam_ts[max_extension_cam]),
+        "contact_ts":        float(contact["contact_ts"]),
+        "acceleration_duration_s": float(cam_ts[contact_cam] - cam_ts[max_extension_cam]),
     }
 
 
@@ -630,54 +662,38 @@ def segment_phases(data: dict, contact: dict) -> dict | None:
 
 def extract_features(data: dict, contact: dict, phases: dict) -> dict:
     """
-    Extract all biomechanical features from one spike.
+    Extract the curated biomechanical features from one spike.
 
-    Features are grouped by source:
-    - [IMU] : from the accelerometer and gyroscope
-    - [CAM] : from the elbow angle (camera)
-    - [PHASE]: timing of each phase
+    Output = 13 MODEL-INPUT features + QC/identifier columns (see the combine block at
+    the end for the exact split). Everything not in the 13 is a QC/identifier column:
+    keep it for filtering and cross-referencing, but NEVER feed it to the classifier.
 
     ⚠️ RELIABILITY WHEN THE ACCEL IS CLIPPED
     =========================================
-    The LSM9DS1 accelerometer hard-clips at ±4g per axis (the Arduino_LSM9DS1
-    library does not allow changing the range), magnitude ceiling = sqrt(3)*4 =
-    6.93G. Measured on the dataset: a median of 13% of samples are clipped, and 95%
-    of sessions have the EXACT sample at the peak clipped.
+    The LSM9DS1 accelerometer hard-clips PER AXIS: ±4g firmware saturates at 4.0
+    (magnitude ceiling sqrt(3)*4 = 6.93G), ±8g firmware at 8.0. On the legacy ±4g
+    dataset a median 13% of samples were clipped and 95% of sessions had the peak
+    sample clipped. Use the accel_range column (4 or 8) to tell them apart.
 
-    NOT trustworthy when clip_fraction is high / peak_is_clipped = 1
-    (values are chopped; hard and very-hard spikes both read ~6.93G, so it COMPRESSES
-     away the difference between skill groups):
-        imu_peak_acc_g, imu_acc_at_contact, imu_ratio_gyro_acc,
-        imu_time_to_peak_acc_s, ipf_confidence
-        (ipf_confidence is affected because IPF = local_dev(acc) × local_dev(gyro))
+    imu_peak_acc_g is NOT trustworthy when clip_fraction is high / peak_is_clipped = 1
+    on a ±4g session (hard and very-hard spikes both read ~6.93G, compressing away the
+    skill difference). ipf_confidence is likewise affected (IPF = local_dev(acc) ×
+    local_dev(gyro)) — but ipf_confidence is QC-only, not a model input.
 
     CLIP-SAFE — gyro does not hit its ±2000dps ceiling (measured max 0.23% of samples):
         imu_peak_gyro_dps, imu_gyro_at_contact, imu_gyro_impulse_duration_s,
-        all cam_*  and  all phase_*
+        imu_gyro_jerk_dimensionless, all cam_*, phase_acceleration_duration_s.
 
-    Companion flag columns for filtering: clip_fraction, peak_is_clipped,
+    Companion flag columns for filtering: clip_fraction, accel_range, peak_is_clipped,
     contact_near_gap, sync_quality_ms, sync_lowlat_fraction, n_contacts_rejected.
 
-    📐 JERK — MOTION SMOOTHNESS
+    📐 JERK — MOTION SMOOTHNESS (gyro only)
     ==================================
-    Jerk = time derivative of acceleration.
-
-    High jerk = jerky motion, abrupt acceleration changes.
-    Low jerk = smooth, controlled motion.
-    Hypothesis: skilled players are smoother in the cocking phase (controlled setup)
-    but may be jerkier in the acceleration phase (a decisive arm swing).
-    imu_acc_jerk_* is NOT TRUSTWORTHY when clip_fraction is high — the chopped signal
-    produces a fake derivative.
-
-    Specifically: the accel clips at ±4g on 69% of contacts. Differentiating a
-    flat-topped segment that then springs back produces a very large FAKE jerk right
-    at the clip. So jerk is computed from BOTH sources for cross-checking:
-        imu_gyro_jerk_*  (°/s²) — TRUSTWORTHY, gyro doesn't hit its ±2000dps ceiling
-        imu_acc_jerk_*   (g/s)  — only use when clip_fraction is low
-
-    *_jerk_dimensionless = (T³/A²)·∫jerk²dt — normalized to remove duration and
-    amplitude, so it compares across spikes of different strength (see _jerk_stats).
-    Comparing raw |jerk| would just re-measure speed, not smoothness.
+    imu_gyro_jerk_dimensionless = (T³/A²)·∫jerk²dt over the acceleration phase —
+    normalized to remove duration and amplitude so it compares across spikes of
+    different strength (see _jerk_stats); comparing raw |jerk| would just re-measure
+    speed, not smoothness. Gyro-based (trustworthy); the accel-based jerk was dropped
+    because a clipped, flat-topped accel segment produces a large FAKE derivative.
 
     ⚠️ cam_vis_* — DATA QUALITY INDICATORS, NOT FEATURES
     =============================================================
@@ -699,30 +715,25 @@ def extract_features(data: dict, contact: dict, phases: dict) -> dict:
     cam_ts  = data["cam_ts"]
     has_imu = data["has_imu"]
 
-    # Shorthand for the phase indices
-    ck_s  = phases["cocking_start_cam"]
-    ck_e  = phases["cocking_end_cam"]
-    acc_e = phases["acceleration_end_cam"]  # = contact frame
-    ft_e  = phases["followthrough_end_cam"]
+    # Phase indices (2-event model): max extension → contact
+    mx_e  = phases["max_extension_cam"]
+    acc_e = phases["contact_cam"]          # = contact frame
 
     # ── ELBOW ANGLE FEATURES ──────────────────────────────────────────
-    # Whole session
-    angle_min  = float(np.min(angles))
-    angle_max  = float(np.max(angles))
-    angle_rom  = angle_max - angle_min  # Range of Motion
-
     # At the contact moment
     angle_at_contact = float(angles[acc_e]) if acc_e < len(angles) else np.nan
 
-    # Max angle in the cocking phase
-    cocking_angles = angles[ck_s:ck_e+1] if ck_e > ck_s else angles[ck_s:ck_s+1]
-    angle_max_cocking = float(np.max(cocking_angles)) if len(cocking_angles) > 0 else np.nan
+    # Max extension angle = elbow angle at the max_extension event (which IS the max
+    # over the [contact − 1.5s, contact] search window). Column name kept for compatibility.
+    angle_max_cocking = float(angles[mx_e]) if mx_e < len(angles) else np.nan
 
-    # Min angle in the acceleration phase (pre-contact)
-    accel_angles = angles[ck_e:acc_e+1] if acc_e > ck_e else angles[acc_e:acc_e+1]
-    angle_min_accel = float(np.min(accel_angles)) if len(accel_angles) > 0 else np.nan
+    # ROM within the acceleration phase [max_extension → contact] ONLY.
+    # BUG FIX: this used to be np.min/np.max over the WHOLE session, so every contact in
+    # a session reported an identical ROM (e.g. all three Vang contacts = 94.901).
+    seg_ang = angles[mx_e:acc_e + 1] if acc_e >= mx_e else angles[acc_e:mx_e + 1]
+    angle_rom = float(np.max(seg_ang) - np.min(seg_ang)) if len(seg_ang) > 0 else np.nan
 
-    # Angular rate of change per phase (deg/s)
+    # Angular closing rate over the acceleration phase (deg/s; negative = snapping down)
     def angular_rate(idx_start, idx_end):
         if idx_end <= idx_start or idx_end >= len(angles) or idx_start >= len(angles):
             return np.nan
@@ -731,9 +742,7 @@ def extract_features(data: dict, contact: dict, phases: dict) -> dict:
             return np.nan
         return float((angles[idx_end] - angles[idx_start]) / dt)
 
-    angle_rate_cocking       = angular_rate(ck_s, ck_e)     # + = opening up
-    angle_rate_acceleration  = angular_rate(ck_e, acc_e)    # - = snapping down
-    angle_rate_followthrough = angular_rate(acc_e, ft_e)
+    angle_rate_acceleration = angular_rate(mx_e, acc_e)
 
     # ── WRIST PATH FEATURES (normalized by arm_length) ─────────────────
     # Divide by arm_length to remove the effect of player-camera distance:
@@ -743,22 +752,22 @@ def extract_features(data: dict, contact: dict, phases: dict) -> dict:
 
     cam_wrist_path_length_norm  = np.nan
     cam_wrist_displacement_norm = np.nan
-    cam_wrist_peak_speed_norm   = np.nan
+    cam_wrist_peak_speed_ratio_per_sec = np.nan
 
     # Only compute when arm_length is valid (>0 and not NaN) — avoid div-by-0 / bad sessions
     if wrist_pos is not None and np.isfinite(arm_length) and arm_length > 0:
-        lo = max(0, ck_s)
-        hi = min(len(wrist_pos) - 1, ft_e)
+        lo = max(0, mx_e)
+        hi = min(len(wrist_pos) - 1, acc_e)
         if hi > lo:
             seg     = wrist_pos[lo:hi+1]                  # (M,3) wrist positions during the spike
             seg_ts  = cam_ts[lo:hi+1]
             steps   = np.diff(seg, axis=0)                # displacement vectors between frames
             step_d  = np.linalg.norm(steps, axis=1)       # length of each step
 
-            # Path length: total distance the wrist travels over the whole spike
+            # Path length: total distance the wrist travels over the acceleration phase
             cam_wrist_path_length_norm = float(np.sum(step_d) / arm_length)
 
-            # Displacement: straight-line distance from cocking start → contact
+            # Displacement: straight-line distance from max extension → contact
             contact_local = min(max(acc_e - lo, 0), len(seg) - 1)
             disp = np.linalg.norm(seg[contact_local] - seg[0])
             cam_wrist_displacement_norm = float(disp / arm_length)
@@ -768,7 +777,7 @@ def extract_features(data: dict, contact: dict, phases: dict) -> dict:
             valid = dt > 0
             if np.any(valid):
                 speed = step_d[valid] / dt[valid]         # pixels/second
-                cam_wrist_peak_speed_norm = float(np.max(speed) / arm_length)
+                cam_wrist_peak_speed_ratio_per_sec = float(np.max(speed) / arm_length)
 
     # ── IMU FEATURES ─────────────────────────────────────────────────
     imu_feats = {}
@@ -793,19 +802,12 @@ def extract_features(data: dict, contact: dict, phases: dict) -> dict:
         gyro_window = gyro[pre_imu:post_imu+1]
         t_window    = imu_t[pre_imu:post_imu+1]
 
-        # Peak values
+        # Peak values (window around contact)
         imu_feats["imu_peak_acc_g"]     = float(np.max(acc_window))
         imu_feats["imu_peak_gyro_dps"]  = float(np.max(gyro_window))
 
-        # Values at contact
-        imu_feats["imu_acc_at_contact"]  = float(acc[contact_imu])
+        # Gyro at contact
         imu_feats["imu_gyro_at_contact"] = float(gyro[contact_imu])
-
-        # Time to peak acc (from cocking start to peak) — measured on the arduino axis
-        peak_acc_local = int(np.argmax(acc_window))
-        imu_feats["imu_time_to_peak_acc_s"] = float(
-            t_window[peak_acc_local] - t_window[0]
-        )
 
         # Impulse duration (time gyro > 50% of peak, proxy for "snap" duration).
         # Sum the REAL duration each sample represents (np.gradient on the arduino
@@ -819,19 +821,14 @@ def extract_features(data: dict, contact: dict, phases: dict) -> dict:
         else:
             imu_feats["imu_gyro_impulse_duration_s"] = 0.0
 
-        # Ratio angular/linear at contact
-        if acc[contact_imu] > 0:
-            imu_feats["imu_ratio_gyro_acc"] = float(gyro[contact_imu] / acc[contact_imu])
-        else:
-            imu_feats["imu_ratio_gyro_acc"] = np.nan
-
-        # IPF value at contact (confidence score)
+        # IPF value at contact — QC/diagnostic ONLY (kept until the contacts.csv path
+        # replaces IPF as the default contact source; NOT a model-input feature).
         imu_feats["ipf_confidence"] = float(contact["ipf_value"])
 
-        # ── DATA QUALITY FLAGS (FIX 3) ───────────────────────────────
-        # peak_is_clipped: whether the sample AT contact has any axis hitting the ±4g ceiling.
-        # If =1, imu_acc_at_contact / imu_peak_acc_g / imu_ratio_gyro_acc for this
-        # spike are CHOPPED values, not the true values.
+        # ── DATA QUALITY FLAGS ───────────────────────────────────────
+        # peak_is_clipped: whether the sample AT contact has any axis hitting the
+        # accel_range ceiling (±4g or ±8g). If =1, imu_peak_acc_g for this spike is a
+        # CHOPPED value, not the true value.
         clip_mask = data["imu_clip_mask"]
         imu_feats["peak_is_clipped"] = int(bool(clip_mask[contact_imu]))
 
@@ -848,46 +845,24 @@ def extract_features(data: dict, contact: dict, phases: dict) -> dict:
                     break
         imu_feats["contact_near_gap"] = near_gap
 
-    # ── JERK / SMOOTHNESS ────────────────────────────────────────────
-    # The spike window is given by CAMERA indices (ck_s→ft_e). Convert to IMU indices
-    # via imu_ts (PC scale — same reference frame as cam_ts), but DIFFERENTIATE on
-    # imu_t (arduino scale, monotonic, correct physical dt).
-    jerk_feats = {}
-    jerk_feats.update(_jerk_stats(None, None, "imu_gyro"))   # default NaN
-    jerk_feats.update(_jerk_stats(None, None, "imu_acc"))
-    jerk_feats["imu_gyro_jerk_rms_cocking"]       = np.nan
-    jerk_feats["imu_gyro_jerk_rms_acceleration"]  = np.nan
-    jerk_feats["imu_gyro_jerk_rms_followthrough"] = np.nan
-
+    # ── JERK / SMOOTHNESS (gyro only — accel clips, gyro doesn't) ─────
+    # Dimensionless gyro jerk over the ACCELERATION phase [max_extension → contact].
+    # Camera indices → IMU indices via imu_ts (PC scale, same frame as cam_ts), but
+    # DIFFERENTIATE on imu_t (arduino scale, monotonic, correct physical dt).
+    jerk_feats = {"imu_gyro_jerk_dimensionless": np.nan}
     if has_imu:
         imu_ts_pc = data["imu_ts"]
         imu_t_ard = data["imu_t"]
-        acc_s, gyro_s = data["imu_acc"], data["imu_gyro"]
+        gyro_s    = data["imu_gyro"]
 
-        def _imu_slice(cam_i0: int, cam_i1: int) -> slice:
-            """IMU indices covering the time span between 2 camera frames."""
-            t0, t1 = float(cam_ts[cam_i0]), float(cam_ts[cam_i1])
-            if t1 < t0:
-                t0, t1 = t1, t0
-            i0 = int(np.searchsorted(imu_ts_pc, t0, side="left"))
-            i1 = int(np.searchsorted(imu_ts_pc, t1, side="right"))
-            return slice(max(0, i0), min(len(imu_t_ard), i1))
-
-        # Whole spike: cocking_start → followthrough_end
-        sl = _imu_slice(ck_s, ft_e)
-        tw = imu_t_ard[sl]
-        jerk_feats.update(_jerk_stats(gyro_s[sl], tw, "imu_gyro"))
-        jerk_feats.update(_jerk_stats(acc_s[sl],  tw, "imu_acc"))
-
-        # Per phase (gyro only — the trustworthy source, not clipped at ±4g)
-        for name, (a, b) in {
-            "cocking":       (ck_s,  ck_e),
-            "acceleration":  (ck_e,  acc_e),
-            "followthrough": (acc_e, ft_e),
-        }.items():
-            s = _imu_slice(a, b)
-            jerk_feats[f"imu_gyro_jerk_rms_{name}"] = _jerk_rms_only(
-                gyro_s[s], imu_t_ard[s])
+        t0, t1 = float(cam_ts[mx_e]), float(cam_ts[acc_e])
+        if t1 < t0:
+            t0, t1 = t1, t0
+        i0 = int(np.searchsorted(imu_ts_pc, t0, side="left"))
+        i1 = int(np.searchsorted(imu_ts_pc, t1, side="right"))
+        sl = slice(max(0, i0), min(len(imu_t_ard), i1))
+        js = _jerk_stats(gyro_s[sl], imu_t_ard[sl], "imu_gyro")
+        jerk_feats["imu_gyro_jerk_dimensionless"] = js["imu_gyro_jerk_dimensionless"]
 
     # ── MEDIAPIPE VISIBILITY (QUALITY INDICATOR, NOT A FEATURE) ──
     vis_sh = data.get("cam_vis_shoulder")
@@ -903,7 +878,7 @@ def extract_features(data: dict, contact: dict, phases: dict) -> dict:
         m = ~np.isnan(a)
         return float(np.mean(a[m] < thr) * 100.0) if m.any() else np.nan
 
-    w0, w1 = min(ck_s, ft_e), max(ck_s, ft_e) + 1     # spike window
+    w0, w1 = min(mx_e, acc_e), max(mx_e, acc_e) + 1     # spike window
     vis_wr_win = vis_wr[w0:w1] if vis_wr is not None else None
 
     means = [_nanmean(vis_sh), _nanmean(vis_el), _nanmean(vis_wr)]
@@ -919,55 +894,51 @@ def extract_features(data: dict, contact: dict, phases: dict) -> dict:
         "cam_vis_wrist_pct_below_05_window": _pct_below(vis_wr_win),
     }
 
-    # ── PHASE TIMING FEATURES ────────────────────────────────────────
-    total_dur = (
-        phases["cocking_duration_s"]
-        + phases["acceleration_duration_s"]
-        + phases["followthrough_duration_s"]
-    )
+    # ── PHASE TIMING FEATURE ─────────────────────────────────────────
     phase_feats = {
-        "phase_cocking_duration_s":       phases["cocking_duration_s"],
-        "phase_acceleration_duration_s":  phases["acceleration_duration_s"],
-        "phase_followthrough_duration_s": phases["followthrough_duration_s"],
-        "phase_total_duration_s":         total_dur,
-        # Time share of each phase (% of total time)
-        "phase_cocking_pct":       phases["cocking_duration_s"] / total_dur * 100 if total_dur > 0 else np.nan,
-        "phase_acceleration_pct":  phases["acceleration_duration_s"] / total_dur * 100 if total_dur > 0 else np.nan,
+        "phase_acceleration_duration_s": phases["acceleration_duration_s"],
     }
 
-    # ── COMBINE ALL FEATURES ─────────────────────────────────────────
+    # ── COMBINE — curated: 13 MODEL-INPUT features + QC/identifier columns ──
+    # Anything not in the 13 model-inputs is a QC/identifier column (keep for filtering
+    # and cross-referencing, never feed to the skill classifier). See docstring.
     features = {
-        "session_name":             data["session_name"],
-        "has_imu":                  int(has_imu),
-        "imu_sample_rate":          float(data["imu_sample_rate"]) if data["imu_sample_rate"] is not None else np.nan,
+        # ── Identifiers / meta ──
+        "session_name":         data["session_name"],
+        "has_imu":              int(has_imu),
+        "contact_frame":        int(acc_e),
+        "contact_ts":           float(contact["contact_ts"]),
+        "contact_ts_offset_s":  float(cam_ts[acc_e] - cam_ts[0]),
 
-        # Data / sync quality — used to filter sessions before analysis
+        # ── Data / sync quality (QC — for filtering, NOT model input) ──
+        "imu_sample_rate":      float(data["imu_sample_rate"]) if data["imu_sample_rate"] is not None else np.nan,
         "imu_timebase":         data["imu_timebase"] if has_imu else "",
         "sync_quality_ms":      float(data["sync_quality_ms"])      if has_imu else np.nan,
         "sync_lowlat_fraction": float(data["sync_lowlat_fraction"]) if has_imu else np.nan,
         "clip_fraction":        float(data["clip_fraction"])        if has_imu else np.nan,
+        "gyro_clip_fraction":   float(data["gyro_clip_fraction"])   if has_imu else np.nan,
+        "accel_range":          data.get("accel_range", np.nan),   # 4, 8 or 24 (±g) — which imu_peak_acc_g is trustworthy
         "n_contacts_rejected":  int(data.get("n_contacts_rejected", 0)),
 
-        "contact_frame":            int(acc_e),
-        "contact_ts_offset_s":      float(cam_ts[acc_e] - cam_ts[0]),
-
-        # Elbow angle
-        "cam_angle_at_contact_deg":     angle_at_contact,
-        "cam_angle_max_cocking_deg":    angle_max_cocking,
-        "cam_angle_min_acceleration_deg": angle_min_accel,
-        "cam_angle_rom_deg":            angle_rom,
-        "cam_angle_rate_cocking_dps":   angle_rate_cocking,
+        # ── MODEL-INPUT FEATURES (13) ──
+        # Elbow angle (camera) — 4
+        "cam_angle_at_contact_deg":        angle_at_contact,
+        "cam_angle_max_cocking_deg":       angle_max_cocking,
+        "cam_angle_rom_deg":               angle_rom,
         "cam_angle_rate_acceleration_dps": angle_rate_acceleration,
-        "cam_angle_rate_followthrough_dps": angle_rate_followthrough,
-
-        # Wrist path (normalized by arm length)
+        # Wrist path, normalized by arm length — 3
         "cam_wrist_path_length_norm":   cam_wrist_path_length_norm,
         "cam_wrist_displacement_norm":  cam_wrist_displacement_norm,
-        "cam_wrist_peak_speed_norm":    cam_wrist_peak_speed_norm,
-
+        "cam_wrist_peak_speed_ratio_per_sec": cam_wrist_peak_speed_ratio_per_sec,
+        # Phase timing — 1  (phase_acceleration_duration_s)
         **phase_feats,
+        # IMU — 4 model-inputs (imu_peak_acc_g, imu_peak_gyro_dps, imu_gyro_at_contact,
+        # imu_gyro_impulse_duration_s) PLUS QC flags (ipf_confidence, peak_is_clipped,
+        # contact_near_gap) carried in the same dict.
         **imu_feats,
+        # Jerk / smoothness — 1  (imu_gyro_jerk_dimensionless)
         **jerk_feats,
+        # ── QC: MediaPipe visibility indicators (NOT model input) ──
         **vis_feats,
     }
 
@@ -989,31 +960,110 @@ def print_session_summary(data: dict, contacts: list, all_phases: list, all_feat
     else:
         print(f"  IMU:    none")
 
+    # Common anchor for cross-referencing with the viewer: the real timestamp.
+    # 'CSV row' is the positional row index (NOT the video frame — the camera_data.csv
+    # 'frame' column is renumbered/inconsistent across sessions). The estimated video
+    # frame lets you scrub the raw mp4: video_frame ≈ round(t_offset × video_fps).
+    cam_ts    = data["cam_ts"]
+    video_fps = data.get("video_fps")
+
     print(f"\n  Detected {len(contacts)} contact event(s):")
     for i, (contact, phases, feats) in enumerate(zip(contacts, all_phases, all_features)):
+        cfi   = contact["cam_frame_idx"]
+        t_off = float(cam_ts[cfi] - cam_ts[0])
+        vframe = f"~{round(t_off * video_fps)}" if video_fps else "n/a (no video)"
         print(f"\n  ── Contact {i+1} ──")
-        print(f"     Camera frame: {contact['cam_frame_idx']}")
-        print(f"     IPF confidence: {contact['ipf_value']:.3f}")
+        print(f"     CSV row {cfi}  |  t={t_off:.3f}s  |  video frame {vframe}"
+              + (f"  (@ {video_fps:.0f} fps)" if video_fps else ""))
+        print(f"     IPF confidence (QC): {contact['ipf_value']:.3f}")
         if data["has_imu"]:
-            print(f"     Acc at contact: {feats.get('imu_acc_at_contact', 'N/A'):.2f} G")
-            print(f"     Gyro at contact: {feats.get('imu_gyro_at_contact', 'N/A'):.1f} °/s")
-            print(f"     Peak acc: {feats.get('imu_peak_acc_g', 'N/A'):.2f} G")
+            print(f"     Gyro at contact: {feats.get('imu_gyro_at_contact', float('nan')):.1f} °/s")
+            print(f"     Peak gyro: {feats.get('imu_peak_gyro_dps', float('nan')):.1f} °/s")
+            print(f"     Peak acc: {feats.get('imu_peak_acc_g', float('nan')):.2f} G "
+                  f"(accel_range ±{feats.get('accel_range', '?')}g)")
 
-        print(f"\n     Phase durations:")
-        print(f"     Cocking:       {phases['cocking_duration_s']*1000:.0f} ms")
-        print(f"     Acceleration:  {phases['acceleration_duration_s']*1000:.0f} ms")
-        print(f"     Follow-through:{phases['followthrough_duration_s']*1000:.0f} ms")
+        print(f"\n     Acceleration phase: "
+              f"{phases['acceleration_duration_s']*1000:.0f} ms "
+              f"(max extension → contact)")
 
         print(f"\n     Elbow angle:")
-        print(f"     Max (cocking):      {feats['cam_angle_max_cocking_deg']:.1f}°")
-        print(f"     At contact:         {feats['cam_angle_at_contact_deg']:.1f}°")
-        print(f"     Min (acceleration): {feats['cam_angle_min_acceleration_deg']:.1f}°")
-        print(f"     ROM:                {feats['cam_angle_rom_deg']:.1f}°")
+        print(f"     Max extension: {feats['cam_angle_max_cocking_deg']:.1f}°")
+        print(f"     At contact:    {feats['cam_angle_at_contact_deg']:.1f}°")
+        print(f"     ROM (phase):   {feats['cam_angle_rom_deg']:.1f}°")
 
 
 # ──────────────────────────────────────────────────────────────────────
 # MAIN PIPELINE
 # ──────────────────────────────────────────────────────────────────────
+
+def _find_manual_contacts_file(session_folder: Path) -> Path | None:
+    """Locate manual_contacts.csv. Search order: the session folder, then up to 3 parent
+    levels, then the directory containing extraction.py. Returns the first that exists."""
+    candidates = [session_folder]
+    p = session_folder
+    for _ in range(3):                       # up to 3 levels up
+        p = p.parent
+        candidates.append(p)
+    candidates.append(Path(__file__).resolve().parent)
+    for c in candidates:
+        f = c / "manual_contacts.csv"
+        if f.exists():
+            return f
+    return None
+
+
+def _load_manual_contacts(session_folder: Path, data: dict) -> list[dict] | None:
+    """Hand-marked contacts (Coleman method) from manual_contacts.csv, replacing IPF.
+
+    Returns a list of contact dicts (same shape as detect_contact_frames), or None if
+    there is no file or no matching row — the caller then falls back to IPF.
+
+    IMPORTANT — contact_ts in the CSV is an OFFSET in seconds from the START of the
+    session's video: exactly the 't = X.XXXs' shown in the dataprocessing HTML viewer,
+    which is cam_ts - cam_ts[0]. The absolute value on the cam_ts clock is therefore
+    cam_ts[0] + offset. (extraction and dataprocessing both drop the same NaN rows, so
+    their cam_ts[0] match.) landing_ts is reserved for a future follow-through feature.
+    """
+    path = _find_manual_contacts_file(session_folder)
+    if path is None:
+        return None
+    try:
+        dfm = pd.read_csv(path)
+    except Exception as e:
+        print(f"  [WARN] Could not read {path.name}: {e}")
+        return None
+    if not {"session_name", "contact_ts"}.issubset(dfm.columns):
+        print(f"  [WARN] {path.name} missing 'session_name'/'contact_ts' columns")
+        return None
+
+    rows = dfm[dfm["session_name"].astype(str) == str(data["session_name"])]
+    rows = rows.dropna(subset=["contact_ts"])
+    if len(rows) == 0:
+        return None
+
+    cam_ts = data["cam_ts"]
+    t0 = float(cam_ts[0])
+    imu_ts = data["imu_ts"] if data["has_imu"] else None
+
+    contacts = []
+    for _, r in rows.iterrows():
+        offset = float(r["contact_ts"])
+        abs_ts = t0 + offset                                   # offset → absolute (cam_ts clock)
+        cam_frame_idx = int(np.argmin(np.abs(cam_ts - abs_ts)))
+        imu_idx = int(np.argmin(np.abs(imu_ts - abs_ts))) if imu_ts is not None else None
+        src = str(r["source"]) if "source" in dfm.columns and pd.notna(r.get("source")) else "manual"
+        contacts.append({
+            "imu_idx":         imu_idx,
+            "cam_frame_idx":   cam_frame_idx,
+            "contact_ts":      abs_ts,
+            "ipf_value":       np.nan,          # not using IPF for manual contacts
+            "acc_at_contact":  None,
+            "gyro_at_contact": None,
+            "source":          src,
+        })
+        print(f"  [INFO] Using manual contact: t={offset:.3f}s (source: {src})")
+    return contacts
+
 
 def process_session(session_folder: Path, verbose: bool = True, force_camera_only: bool = False) -> list[dict]:
     """
@@ -1027,7 +1077,11 @@ def process_session(session_folder: Path, verbose: bool = True, force_camera_onl
     if data is None:
         return []
 
-    contacts = detect_contact_frames(data)
+    # PART 1: prefer the hand-marked contact (manual_contacts.csv); if absent -> IPF.
+    contacts = _load_manual_contacts(session_folder, data)
+    if contacts is None:
+        print(f"  [WARN] No manual contact for {data['session_name']}, falling back to IPF")
+        contacts = detect_contact_frames(data)
     if len(contacts) == 0:
         print(f"  [SKIP] No contact event detected")
         return []
