@@ -1,411 +1,112 @@
-# Hybrid Motion Capture System — Volleyball Spike Analysis
-
-A dual-sensor motion capture system combining an inertial measurement unit (IMU) worn on the arm with computer vision (camera + MediaPipe) to record, analyse, and visualise volleyball spike mechanics — and a downstream **feature-extraction and machine-learning pipeline** that turns recorded sessions into biomechanical features and a professional-vs-amateur classifier.
-
-The project has **two halves**:
-
-1. **Data collection & review** (`mainpy.py`, `cameraclient.py`, `imuclient.py`, `dataprocessing.py`) — records synchronised IMU + camera sessions and lets you review each one in a desktop viewer.
-2. **Analysis & modelling** (`extraction.py`, `src/prepare_dataset.py`, `src/promote_session.py`, `src/train_model.py`) — extracts per-spike biomechanical features and trains/evaluates a classifier.
-
-> ⚠️ **On the current results:** the dataset has only 4 players, which is far too few to draw any conclusion. The modelling pipeline is built to be **re-run when more data arrives**, not to publish accuracy. The evaluation reports its own limits bluntly (see `models/model_metrics.json` → `trustworthy: false`). A detailed file-by-file map of the analysis half lives in **`FILE_MAP.md`**.
-
----
-
-## Table of Contents
-
-1. [System Architecture](#1-system-architecture)
-2. [Hardware Requirements](#2-hardware-requirements)
-3. [Environment Setup](#3-environment-setup)
-4. [Usage Guide](#4-usage-guide)
-5. [Session Folder Structure](#5-session-folder-structure)
-6. [Module Reference](#6-module-reference)
-7. [Viewer & Analysis Charts](#7-viewer--analysis-charts)
-8. [Offline Video Analysis](#8-offline-video-analysis)
-9. [Analysis & Modelling Pipeline](#9-analysis--modelling-pipeline)
-10. [Troubleshooting](#10-troubleshooting)
-
----
-
-## 1. System Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        mainpy.py                                │
-│                    (Central Orchestrator)                       │
-│         CLI: start / stop / exit    │    asyncio event loop     │
-└────────────┬───────────────────────────────┬────────────────────┘
-             │                               │
-             ▼                               ▼
-┌────────────────────┐           ┌────────────────────────┐
-│   imuclient.py     │           │    cameraclient.py     │
-│  Arduino Nano BLE  │           │  Iriun Webcam / Cam 0  │
-│                    │           │                        │
-│  Dedicated BLE     │           │  Dedicated camera      │
-│  thread            │           │  thread                │
-│  100 Hz (batch×5)  │           │  60 FPS recording      │
-│  RAM buffer → CSV  │           │  raw_video.mp4         │
-│  imu_data.csv      │           │  → MediaPipe offline   │
-└────────────────────┘           │  → camera_data.csv     │
-             │                   │  → annotated_video.mp4 │
-             │                   └────────────┬───────────┘
-             │                                │
-             └────────────┬───────────────────┘
-                          │
-                          ▼
-             ┌────────────────────────┐
-             │    dataprocessing.py   │
-             │                        │
-             │  EMA filter            │
-             │  IMU fusion (interp)   │
-             │  Elbow angle calc      │
-             │  → motion_report.html  │
-             │  → Open_Viewer.bat     │
-             │  → PyQt6 viewer        │
-             └────────────────────────┘
-
-  ═══════════════ ANALYSIS & MODELLING HALF ═══════════════
-
-  recording/<session>/          (a good session, reviewed by eye)
-          │  src/promote_session.py   (copy + auto-update metadata)
-          ▼
-  ../Zipped data/{Amatures|Proffesionals}/<session>/   +   prepared_dataset/metadata.csv
-          │  extraction.py --root "../Zipped data"
-          ▼
-  features.csv   (one row per detected spike, 54 columns)
-          │  src/train_model.py  features.csv --metadata prepared_dataset/metadata.csv
-          ▼
-  results.csv · feature_importance.csv · models/  (joblib + feature_list + metrics)
-```
-
-**Data flow (collection half):**
-- IMU (100 Hz) and Camera (60 FPS) run in parallel on independent threads
-- Both use `time.perf_counter()` for PC-side timestamps → enables accurate post-hoc synchronisation
-- After `stop`: IMU flushes RAM → `imu_data.csv`; camera runs MediaPipe offline → `camera_data.csv` + `annotated_video.mp4`
-- `dataprocessing.py` reads both CSVs, fuses the data streams, and outputs an HTML report + viewer
-
-**Data flow (analysis half):**
-- `mainpy.py` writes a `session_info.json` (professional / amateur / test) into each session
-- `promote_session.py` moves a good session into the research dataset (`Zipped data`), refusing test sessions, and updates `metadata.csv` (merge, never overwrite)
-- `extraction.py` recursively scans `Zipped data`, detects the ball-contact frame per spike, segments the spike into 3 phases, and writes `features.csv`
-- `train_model.py` joins features with `metadata.csv`, splits **by player** (LeaveOneGroupOut), and evaluates a Dummy / LogisticRegression / RandomForest ladder — plus confound checks
-
----
-
-## 2. Hardware Requirements
-
-| Device | Role | Notes |
-|--------|------|-------|
-| Arduino Nano 33 BLE | Captures IMU data (ax,ay,az,gx,gy,gz) @ 100 Hz | Worn on the forearm near the wrist of the spiking arm |
-| Smartphone with Iriun Webcam | 60 FPS camera input | Connect via USB or WiFi; appears as camera Index 1 |
-| Windows PC | Runs all processing | Python 3.10, sufficient RAM for IMU buffering |
-
-**Camera fallback:** If Iriun is unavailable, the system automatically falls back to the default webcam (Index 0).
+# Hybrid Motion Capture for Volleyball Spikes
 
----
+This project records a volleyball spike with two sensors at the same time and turns each recording into a small set of biomechanical features.
 
-## 3. Environment Setup
+- A **wrist-worn IMU** (Arduino Nano 33 BLE) measures acceleration and rotation speed at about 100 samples per second and sends them to a laptop over Bluetooth.
+- A **camera** (a phone used as a webcam) films the athlete. MediaPipe Pose then finds the shoulder, elbow and wrist in every frame.
 
-```bash
-# Clone the repository
-git clone https://github.com/minhkhoo/motioncapture
-cd motioncapture
+The laptop software starts and stops both sensors together, saves everything into one folder per attempt, and later computes features such as the elbow angle at ball contact and how far the wrist travels during the swing.
 
-# Install all dependencies
-uv sync
+This repository contains the recording software, the Arduino firmware, and the processing scripts. It does not contain any recorded data. You record your own sessions and the scripts work on those.
 
-# Install PyQt6 WebEngine (required for the viewer)
-uv add pyqt6-webengine
-```
-
-**Key dependencies:**
-- `bleak==0.22.3` — BLE communication with Arduino
-- `mediapipe==0.10.9` — Pose estimation (skeleton tracking)
-- `opencv-python` — Video read/write, frame processing
-- `pandas`, `numpy`, `scipy` — Data processing and filtering
-- `plotly` — Interactive 3D and 2D charts
-- `PyQt6` + `PyQt6-WebEngine` — Desktop viewer
-
----
-
-## 4. Usage Guide
-
-### 4.1 Recording a new session
-
-```bash
-uv run python mainpy.py
-```
-
-The startup menu appears:
-```
-1. Camera only
-2. IMU sensor only
-3. Both devices simultaneously
-```
-
-After selecting a mode:
-```
-=== SYSTEM READY (type: start / exit) ===
-> start
-Session kind?  [1] professional   [2] amateur   [3] test
-Enter your choice (1/2/3): 1
-Enter athlete name or ID: Hoang
->>> RECORDING DATA (type 'stop' to finish)
-> stop
-```
-
-The **session kind** question is important for the analysis half:
-- **[1] professional / [2] amateur** → prompts for the athlete name; folder is `<name>_<timestamp>/`
-- **[3] test** → no name; folder is `TEST_<timestamp>/`, and `promote_session.py` will refuse to add it to the research dataset
-
-Either way, a `session_info.json` is written into the session folder (the source of truth used later by `promote_session.py` and `prepare_dataset.py`).
-
-The system then automatically:
-1. Stops IMU recording and flushes RAM → `imu_data.csv`
-2. Stops camera recording and runs MediaPipe offline (may take ~30 seconds)
-3. Exports `camera_data.csv` + `annotated_video.mp4`
-4. Exports `motion_report.html` + `Open_Viewer.bat`
-
-### 4.2 Reviewing a recorded session
-
-```bash
-# Open the viewer for a specific session
-uv run python dataprocessing.py recording/Hoang_20260612_110759
-
-# Or double-click the shortcut inside the session folder
-Open_Viewer.bat
-```
-
-### 4.3 Analysing an existing video (no Arduino required)
-
-```bash
-# Analyse any video file and create a new session
-uv run python dataprocessing.py spike_clip.mp4
-
-# Analyse the left arm instead
-uv run python dataprocessing.py spike_clip.mp4 --side LEFT
-
-# Use the most accurate model (slower)
-uv run python dataprocessing.py spike_clip.mp4 --complexity 2
-
-# Write output into an existing session folder
-uv run python dataprocessing.py recording/Hoang_20260612_110759/raw_video.mp4 --out recording/Hoang_20260612_110759
-```
-
----
-
-## 5. Session Folder Structure
-
-```
-recording/
-└── Hoang_20260612_110759/
-    ├── raw_video.mp4          ← Raw camera footage (XVID codec)
-    ├── annotated_video.mp4    ← Video with skeleton overlay (mp4v codec)
-    ├── camera_data.csv        ← Per-frame 3D coordinates: shoulder/elbow/wrist
-    ├── imu_data.csv           ← ax,ay,az,gx,gy,gz @ 100 Hz from Arduino
-    ├── session_info.json      ← {session_kind, player_id, recorded_at} — source of truth for the analysis half
-    ├── motion_report.html     ← Combined report (opened automatically by viewer)
-    └── Open_Viewer.bat        ← Double-click shortcut to open viewer
-```
-
-**Files that can be deleted:**
-- `temp_timestamps.csv` — temporary file, deleted automatically after post-processing
-- `raw_video_h264.mp4` — created by an older code version, safe to remove
-- `Xem_Do_Thi_3D.bat` — created by an older code version, replaced by `Open_Viewer.bat`
-
-**`camera_data.csv` format:**
-```
-frame, timestamp, shoulder_x, shoulder_y, shoulder_z, shoulder_visibility,
-       elbow_x, elbow_y, elbow_z, elbow_visibility,
-       wrist_x, wrist_y, wrist_z, wrist_visibility
-```
-- Coordinates are normalised to [0.0 – 1.0] relative to frame width/height
-- `timestamp` = PC `time.perf_counter()` value at the moment the frame was captured
-
-**`imu_data.csv` format:**
-```
-pc_time, arduino_time, ax, ay, az, gx, gy, gz
-```
-- `ax,ay,az` = linear acceleration (G-force)
-- `gx,gy,gz` = angular velocity (°/s or rad/s)
-- `pc_time` = PC timestamp (synchronised with camera)
-- `arduino_time` = Arduino `millis()` value (reference only)
-
----
-
-## 6. Module Reference
-
-### `mainpy.py` — Central Orchestrator
-- Runs an `asyncio` event loop on the main thread listening for CLI commands
-- Initialises the camera thread and BLE thread independently
-- Manages the full recording lifecycle: `open_session → start → stop → close_session`
-- After stop: automatically calls `dataprocessing.run()` to export the report
-
-### `cameraclient.py` — Camera Pipeline
-- Connects to the camera via OpenCV (Index 1 = Iriun, fallback to Index 0)
-- A `run()` thread continuously captures frames; only writes to disk when `collect_event` is set
-- Writes in parallel: frames → `raw_video.mp4`, timestamps → `temp_timestamps.csv`
-- After stop, `_run_offline_post_processing()` runs MediaPipe on each frame:
-  - Detects body skeleton and draws overlay (full body in grey, spiking arm highlighted in cyan)
-  - Renders elbow angle as text on each frame
-  - Exports `camera_data.csv` + `annotated_video.mp4`
-
-### `imuclient.py` — BLE IMU Client
-- Runs a BLE event loop on a dedicated thread (required on Windows due to COM threading constraints)
-- Uses **data batching**: Arduino sends 5 readings per BLE packet (140 bytes), bypassing the Windows BLE stack's ~20 notification/second limit → achieves **100 Hz** effective sample rate
-- Data is buffered in RAM (O(1) per reading) and flushed to disk in a single write at the end of the session — eliminates I/O bottleneck during recording
-- Sends `START`/`STOP` commands via BLE Write characteristic
-
-### `shareddata.py` — Shared Memory
-- `camera_buffer`, `imu_buffer`: deques (maxlen=20000) for live cross-thread data sharing
-- `session_dir`: path of the active session folder
-- `graph_running`, `program_running`: coordination flags between threads
-
-### `dataprocessing.py` — Processing & Visualisation
-
-**Step A — EMA Filter (coordinate smoothing):**
-```
-x_smooth = alpha × x_smooth_prev + (1 − alpha) × x_raw
-```
-- Shoulder: alpha=0.85 (heavy smoothing — stable reference origin)
-- Elbow: alpha=0.50
-- Wrist: alpha=0.30 (faster response to preserve swing detail)
-
-**Step B — IMU Data Fusion:**
-- Computes `accel_magnitude = sqrt(ax² + ay² + az²)` and removes baseline offset
-- Uses `numpy.interp` to align 100 Hz IMU timestamps with 60 FPS camera timestamps
-
-**Step C — Elbow Angle Calculation:**
-```
-angle = 180° − arccos( (v1 · v2) / (|v1| × |v2|) )
-```
-Where v1 = elbow − shoulder, v2 = wrist − elbow
-
-**Step D — HTML Report + PyQt6 Viewer:**
-- HTML contains all session data as inline JSON (no server required)
-- PyQt6 viewer: `QMediaPlayer` (video) + `QWebEngineView` (graphs) inside a `QSplitter`
-- `graphs_only.html`: a stripped version of the HTML with the video panel removed, served to Chromium for graph-only rendering
-
-### `extraction.py` — Feature Extraction *(analysis half, at repo root)*
-- Reads `camera_data.csv` + `imu_data.csv` per session and writes one row per detected spike to `features.csv`
-- **Contact detection (IPF)**: `IPF = local_dev(accel) × local_dev(gyro)` peaks at the ball-contact moment
-- **Phase segmentation**: splits each spike into cocking / acceleration / follow-through
-- Two IMU time axes with separate roles: `arduino_time` (monotonic, for all internal timing) vs a PC-mapped axis (only for comparing to the camera). The PC mapping uses an NTP-style lower-envelope fit.
-- Flags data-quality problems per spike: `clip_fraction`, `peak_is_clipped` (the LSM9DS1 accel hard-clips at ±4g), `contact_near_gap`, `sync_quality_ms`
-- Run: `python extraction.py --root "../Zipped data" --output features.csv --quiet`
-
-### `src/prepare_dataset.py` — Metadata Builder *(analysis half)*
-- Recursively scans `Zipped data`, copies each session's files into `prepared_dataset/` with an `attempt_id` prefix, and **merges** into `metadata.csv` (keeps hand-edited `good_recording` / `notes`, never overwrites; backs up `.bak`)
-- Skips test sessions; lists any session whose `skill_level` could not be inferred
-
-### `src/promote_session.py` — Session Promotion *(analysis half)*
-- One command to move a recorded session from `recording/` into `Zipped data/{Proffesionals|Amatures}/` and update `metadata.csv`
-- **Refuses test sessions** unless `--force`; supports `--dry-run`
-- Run: `python src/promote_session.py recording/<session>`
-
-### `src/train_model.py` — Training & Evaluation *(analysis half)*
-- Joins `features.csv` with `metadata.csv` (the **single source of truth** — only listed sessions are used)
-- Splits **by player** (LeaveOneGroupOut) so no player appears in both train and test
-- Model ladder: `DummyClassifier` → `LogisticRegression` → `RandomForest`; reports **balanced accuracy** and macro-F1, pooled across folds
-- **Confound checks**: re-predicts `session_type` with the same features, and correlates each feature with recording-quality signals — to detect whether the model is learning recording conditions instead of skill
-- Outputs: `results.csv`, `feature_importance.csv`, `models/spike_skill_model.joblib`, `models/feature_list.json`, `models/model_metrics.json`
-
----
-
-## 7. Viewer & Analysis Charts
-
-Opened via `Open_Viewer.bat` or `uv run python dataprocessing.py <session_folder>`:
-
-```
-┌──────────────────┬──────────────────────────────────────────────┐
-│   📹  VIDEO      │  ◈ 3D View  │ ◈ Front (Z–Y) │ ◈ Bird (X–Z) │
-│                  │───────────────────────────────────────────── │
-│  QMediaPlayer    │       📈 Elbow Angle & IMU Acceleration      │
-│  (native codec)  │                                              │
-│                  │  ● Green line  = elbow angle (°)             │
-│  Frame 127       │  ● Orange line = IMU acceleration (G)        │
-│  152.0°  9.929s  │  ● Cyan dashed = current frame cursor        │
-├──────────────────┤                                              │
-│ ▶ Play  ⏮ ‹ › ⏭ │                                             │
-│ 📹 Annotated     │                                             │
-│ 1.00×            │                                              │
-└──────────────────┴──────────────────────────────────────────────┘
-```
-
-**Controls:**
-- `Space` — Play / Pause
-- `←` `→` — Step ±1 frame
-- `Shift+←` `Shift+→` — Jump ±10 frames
-- **📹 Annotated** button — Toggle between raw video and skeleton overlay video
-- Speed selector — 0.25×, 0.5×, 1×, 2×
-
-**Three coordinate views (all relative to the shoulder as origin):**
-- **3D View** — Free-angle interactive view; rotate with mouse while paused
-- **Front View (Z–Y)** — Camera-facing plane (depth vs height); matches what the camera sees
-- **Birdeye View (X–Z)** — Top-down plane (lateral vs depth)
-
-Faded trail = full session trajectory | Bright trail = most recent 45 frames
-
----
-
-## 8. Offline Video Analysis
-
-No Arduino required — works with any video file:
-
-```bash
-uv run python dataprocessing.py <input> [--side RIGHT|LEFT] [--complexity 0|1|2] [--out <folder>] [--no-viewer]
-```
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--side` | RIGHT | Which arm to analyse |
-| `--complexity` | 1 | MediaPipe model: 0=fast, 1=balanced, 2=most accurate |
-| `--out` | auto | Custom output folder |
-| `--no-viewer` | False | Export files only, do not open viewer |
-
-If detection rate is low (<50%), try `--complexity 2` or check lighting and camera angle.
-
----
-
-## 9. Analysis & Modelling Pipeline
-
-Run every command from the `motioncapture/` folder. See **`FILE_MAP.md`** for a file-by-file map, column dictionaries, and current known issues.
-
-**Full workflow after recording a good session:**
-
-```bash
-# 1. Promote a reviewed session into the research dataset (one command)
-python src/promote_session.py recording/<session>
-#    → copies into ../Zipped data/, refuses test sessions, updates metadata.csv (merge)
-#    Then open prepared_dataset/metadata.csv and, by eye: set good_recording=no for bad
-#    sessions, fill session_type (primary/secondary) after reviewing the video, add notes.
-
-# 2. Extract features from the whole dataset (~2s for ~24 sessions)
-python extraction.py --root "../Zipped data" --output features.csv --quiet
-
-# 3. Train + evaluate (5–15s)
-python src/train_model.py features.csv --metadata prepared_dataset/metadata.csv
-
-# 4. Trace confounds across feature sets (optional, 20–40s)
-python src/train_model.py features.csv --metadata prepared_dataset/metadata.csv --compare-feature-sets
-```
-
-**Key rules:**
-- `metadata.csv` is the **single source of truth** — a session in `features.csv` that is not listed there is ignored. This is deliberate: `recording/` contains many throwaway test sessions.
-- Always use `extraction.py --root` on `Zipped data`, **not** `--all` on `recording/` (that would miss sessions that only exist in `Zipped data`).
-- `train_model.py` never mixes a player across train/test; with only 4 players it prints a **loud warning** and treats results as not reliable.
-
-**Automation status:** the mechanical steps (copy, rename, metadata update) are automated by `promote_session.py`; the **judgment** steps (reviewing video, deciding `good_recording`, rating `session_type`, writing `notes`) are intentionally left manual.
-
----
-
-## 10. Troubleshooting
-
-| Symptom | Likely Cause | Solution |
-|---------|-------------|----------|
-| `raw_video.mp4` is 0–1 KB | Camera disconnected mid-recording (Iriun dropped due to device overheating or unstable WiFi/USB connection) | Use USB cable instead of WiFi; ensure device is cool before recording |
-| `ModuleNotFoundError: PyQt6.QtWebEngineWidgets` | Missing package | Run `uv add pyqt6-webengine` |
-| Video spins indefinitely in browser | CORS blocks `file:///` local resource loading | Use `Open_Viewer.bat` instead of opening the HTML directly in a browser |
-| Charts are empty, `seek is not defined` error | JS crashed before Plotly initialised (null DOM element) | Fixed in current version via null-checks on all DOM elements |
-| BLE cannot find Arduino | Wrong device name or not paired | Verify `DEVICE_NAME = "Nano33BLE"` in `imuclient.py` |
-| Low pose detection rate | Poor lighting, occluded body, or low model complexity | Add `--complexity 2`; ensure the full upper body is visible in frame |
-| Video and graphs play out of sync | FPS mismatch between video file and CSV-derived value | Fixed in current version: FPS is now read directly from the video file via `cv2.CAP_PROP_FPS` |
+## What you need
+
+Hardware: an Arduino Nano 33 BLE with its battery and enclosure (worn on the wrist of the hitting arm), a smartphone running the Iriun Webcam app on a tripod, and a Windows laptop with Bluetooth. The recording code only runs on Windows.
+
+Software: Python 3.10 and the `uv` package manager.
+
+## Setup
+
+Install the dependencies:
+
+    git clone https://github.com/minhkhoo/motioncapture
+    cd motioncapture
+    uv sync
+
+Then flash the Arduino with the sketch in `firmware/`. The steps, the library you must install, and the Bluetooth packet format are described in `firmware/README.md`.
+
+If your phone camera does not appear as camera number 1 on your laptop, change `CAMERA_INDEX` at the top of `cameraclient.py`. If the laptop cannot find the Arduino by its name (`Nano33BLE`), put its Bluetooth address in `ADDRESS` at the top of `imuclient.py`.
+
+## Step 1: Record a session
+
+Switch the Arduino on, start Iriun on the phone and the laptop, then run:
+
+    uv run python mainpy.py
+
+The program first asks which devices to use: camera only, IMU only, or both. Choose both for normal use. It connects to the Arduino and keeps the Bluetooth link open between recordings.
+
+Then type `start`. The program asks what kind of session it is: professional, amateur, or test. For the first two it also asks for the athlete's name or ID. Recording begins right away. Perform the spike, then type `stop`. You can repeat start and stop as many times as you like, and `exit` closes the program.
+
+Each recording creates a folder in `recording/`, named after the athlete and the start time, for example `recording/Alex_20260812_120719/`. Test sessions are named `TEST_` plus the time. The folder contains:
+
+- `session_info.json`: whether the session was professional, amateur or test, and the athlete ID.
+- `raw_video.mp4` and `frame_timestamps.csv`: the video as filmed and the exact laptop time of each frame.
+- `imu_data.csv`: the IMU samples. Each row has the laptop time, the Arduino time, three acceleration values (in g) and three rotation values (in degrees per second).
+- `camera_data.csv`: the shoulder, elbow and wrist positions found by MediaPipe for every frame. This file is produced right after you type `stop`, and it can take a while for long videos.
+- `annotated_video.mp4`: the video with the skeleton drawn on it.
+- `motion_report.html`: an interactive report, made automatically when camera data exists.
+
+The camera is started before the IMU on purpose, because sending the start command over Bluetooth can take a moment. Both streams use the laptop clock, which is what allows the two to be lined up afterwards. If either sensor stops sending data for more than two seconds, the program prints a warning but keeps recording. If Bluetooth drops, the program tries to reconnect in the background without interrupting the camera.
+
+## Step 2: Look at a session and mark the contact time
+
+To open the viewer for one session:
+
+    uv run python dataprocessing.py recording\Alex_20260812_120719
+
+The viewer plays the annotated video together with three views of the skeleton (3D, front, and top-down) and one chart that shows the elbow angle and the IMU acceleration (in g) over time. It shows the time since the start of the video as `t = X.XXXs`. Step through the video, find the frame where the hand hits the ball, and write down that time. You will need it in the next step.
+
+`dataprocessing.py` can also analyse an ordinary video file with no IMU: `uv run python dataprocessing.py spike.mp4`.
+
+## Step 3: Build the tracking sheet
+
+Run:
+
+    uv run python build_tracking.py
+
+This scans `recording/` and creates `data_tracking.xlsx`, with one row per session. It skips test sessions, sessions whose folder name contains `error`, and sessions without `session_info.json`.
+
+Each row has two kinds of columns. The script fills the quality columns automatically every time it runs: how many samples the IMU delivered, how much data was lost, whether the sensor was moving at all, whether the signal hit the sensor's limit, and how many frames the camera delivered and in how many of them a person was found. The `imu_verdict` column summarises whether the IMU data is usable. Its value is `yes`, or `no` followed by the reason in brackets: missing file, dead baseline, or too much packet loss.
+
+You fill the manual columns yourself, and the script never overwrites them. The important one is `contact_ts`: type the contact time you read in the viewer. You can also use `good_recording`, `quality_star` and `notes`. If a recording is unusable, write `error` in `contact_ts` and it will be skipped later.
+
+After you have entered contact times, run `build_tracking.py` again. It also writes `manual_contacts.csv`, the list of contact times that the feature extraction reads.
+
+`docs/data_tracking_columns_EN.md` explains every column of the sheet.
+
+## Step 4: Extract the features
+
+Run:
+
+    uv run python build_features_tracking.py
+
+For every session that has a valid `contact_ts`, this runs `extraction.py` and writes one row to `features_tracking.csv`. A session with a blank or `error` contact time is skipped.
+
+`extraction.py` works on the camera positions of the right shoulder, elbow and wrist. It uses the hand-marked contact time, then finds the moment of maximum elbow extension in the 1.5 seconds before contact. The time between those two moments is the acceleration phase of the swing. The eight features are:
+
+- the elbow angle at contact
+- the largest elbow angle before the acceleration phase (maximum cocking angle)
+- the range of the elbow angle in the spike window
+- the average elbow angular speed during the acceleration phase
+- the distance the wrist travels during the acceleration phase
+- the straight-line distance of the wrist from maximum extension to contact
+- the peak wrist speed
+- the duration of the acceleration phase
+
+Wrist distances and speeds are divided by the athlete's arm length measured in the image, so they have no unit. They are comparable between people, but they are not metres. `features_tracking.csv` also records the player, skill level, session date, the camera frame rate and the percentage of frames where a person was detected.
+
+## Things to know before you trust the data
+
+Check `imu_verdict` before using any IMU number. A recording can have no IMU file at all (the Bluetooth link never started), too many lost packets, or a sensor that stayed still. In our own recordings more than half of the sessions had unusable IMU data. The camera features do not depend on the IMU.
+
+The IMU sampling is not perfectly regular. The effective rate and the amount of lost data are measured for every session, so look at those columns when you compare sessions.
+
+The accelerometer was recorded at different sensitivity settings in different sessions (see `firmware/README.md`). Older recordings made at lower ranges clip on hard impacts.
+
+## Repository contents
+
+See `FILE_MAP.md` for a one-line description of every file.
+
+## License
+
+See the `LICENSE` file.
