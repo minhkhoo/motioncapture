@@ -93,7 +93,7 @@ For every session that has a valid `contact_ts`, this runs `extraction.py` and w
 - the peak wrist speed
 - the duration of the acceleration phase
 
-Wrist distances and speeds are divided by the athlete's arm length measured in the image, so they have no unit. They are comparable between people, but they are not metres. `features_tracking.csv` also records the player, skill level, session date, the camera frame rate and the percentage of frames where a person was detected.
+Wrist distances and speeds are divided by the athlete's upper-arm length (shoulder to elbow, taken from the same image coordinates), so they have no unit. This makes them less dependent on how far the athlete stands from the camera, but they are not metres, and the image coordinates themselves are not corrected for the image shape. `features_tracking.csv` also records the player, skill level, session date, the camera frame rate and the percentage of frames where a person was detected.
 
 ## Things to know before you trust the data
 
