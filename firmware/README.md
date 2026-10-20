@@ -91,6 +91,8 @@ to about ±24 g) so that hard impacts do not clip. Earlier recordings used ±4 g
 ±8 g; `build_tracking.py` estimates the range of each recording from its peak values
 (above 8.5 g: 24 g; above 4.05 g: 8 g; otherwise 4 g), so older data is handled too.
 
+The LSM9DS1 datasheet specifies 16 g as the largest accelerometer range. The library scales index 1 so that the 16-bit output reaches about 24 g; readings above 16 g are outside the specified range. The library converts gyroscope counts at 2000/32768 degrees per second per count, about 13 percent below the datasheet sensitivity of 70 mdps per count, and all angular velocities in the data are in that library scaling.
+
 ## Versions used
 | Component | Version |
 |-----------|---------|
