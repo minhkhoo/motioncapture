@@ -66,7 +66,7 @@ Run:
 
 This scans `recording/` and creates `data_tracking.xlsx`, with one row per session. It skips test sessions, sessions whose folder name contains `error`, and sessions without `session_info.json`.
 
-Each row has two kinds of columns. The script fills the quality columns automatically every time it runs: how many samples the IMU delivered, how much data was lost, whether the sensor was moving at all, whether the signal hit the sensor's limit, and how many frames the camera delivered and in how many of them a person was found. The `imu_verdict` column summarises whether the IMU data is usable. Its value is `yes`, or `no` followed by the reason in brackets: missing file, dead baseline, or too much packet loss.
+Each row has two kinds of columns. The script fills the quality columns automatically every time it runs: how many samples the IMU delivered, how much data was lost, whether the sensor was moving at all, whether the signal hit the sensor's limit, and how many frames the camera delivered and in how many of them a person was found. The `imu_verdict` column summarises whether the IMU data is usable. Its value is `yes`, or `no` followed by the reason in brackets: missing file, a sampling rate below 30 Hz, too much packet loss, or a sensor that did not move (dead baseline).
 
 You fill the manual columns yourself, and the script never overwrites them. The important one is `contact_ts`: type the contact time you read in the viewer. You can also use `good_recording`, `quality_star` and `notes`. If a recording is unusable, write `error` in `contact_ts` and it will be skipped later.
 

@@ -40,6 +40,9 @@ TRACK_XLSX = ROOT / "data_tracking.xlsx"
 MANUAL_CSV = ROOT / "manual_contacts.csv"
 
 LOSS_DEAD = 50    # loss above this -> treated as NO usable IMU (IMU-related features unreliable)
+RATE_MIN_HZ = 30  # effective sampling rate below this -> not usable
+DEAD_ACC_G = 2.0      # peak acceleration below this ...
+DEAD_GYRO_DPS = 100   # ... or peak angular velocity below this -> the sensor did not move (dead baseline)
 
 MANUAL_COLS = ["contact_ts", "landed_ts", "good_recording", "quality_star", "notes"]
 SKILL_FROM_FOLDER = {"amatures": "amateur", "proffesionals": "professional"}
@@ -58,6 +61,11 @@ SKILL_FROM_PLAYER = {"hieu": "professional", "hoang": "professional",
 def quality_metrics(folder: Path) -> dict:
     camp = folder / "camera_data.csv"
     imup = folder / "imu_data.csv"
+    if not imup.exists():
+        # a few sessions keep a renamed IMU file (e.g. imu_data_deadbaseline.csv)
+        alt = sorted(folder.glob("imu_data*.csv"))
+        if alt:
+            imup = alt[0]
     r = {}
     # ---- CAMERA ----
     camok = False
@@ -108,7 +116,7 @@ def quality_metrics(folder: Path) -> dict:
         small = dat[(dat > 0.020) & (dat <= 0.1)]
         lost_stall = int(np.sum(np.round(stalls / 0.01) - 1)); lost_small = int(np.sum(np.round(small / 0.01) - 1))
         acc = np.sqrt(di["ax"]**2 + di["ay"]**2 + di["az"]**2); gy = np.sqrt(di["gx"]**2 + di["gy"]**2 + di["gz"]**2)
-        accpk = float(acc.max()); gypk = float(gy.max()); alive = accpk > 3 and gypk > 200
+        accpk = float(acc.max()); gypk = float(gy.max())
         ax = max(np.abs(di["ax"]).max(), np.abs(di["ay"]).max(), np.abs(di["az"]).max())
         rng = 24 if ax > 8.5 else (8 if ax > 4.05 else 4)
         ceil = 23.99 if rng == 24 else (7.99 if rng == 8 else 3.99)
@@ -118,10 +126,13 @@ def quality_metrics(folder: Path) -> dict:
         # single axis anywhere near its real +-2000 dps ceiling. Gyro FS never
         # changes across firmware versions (Part C1 audit: no .ino calls setGyroFS).
         gclip = 100 * ((np.abs(di["gx"]) >= 1999.0) | (np.abs(di["gy"]) >= 1999.0) | (np.abs(di["gz"]) >= 1999.0)).sum() / len(di)
-        if not alive:
-            verdict = "no (dead baseline)"
+        # Checks in order: rate, loss, dead baseline (the missing-file check is above).
+        if round(freq, 1) < RATE_MIN_HZ:
+            verdict = f"no (rate {freq:.0f} Hz<{RATE_MIN_HZ})"
         elif loss > LOSS_DEAD:
             verdict = f"no (loss {loss:.0f}%>{LOSS_DEAD})"
+        elif accpk < DEAD_ACC_G or gypk < DEAD_GYRO_DPS:
+            verdict = "no (dead baseline)"
         else:
             verdict = "yes"
         r.update(imu_freq_hz=round(freq, 1), imu_stalls=int(len(stalls)), imu_max_stall_ms=round(maxstall),

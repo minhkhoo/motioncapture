@@ -117,14 +117,15 @@ inside that window the numbers for that session are unreliable.
 The overall judgement on whether this session's IMU data is usable:
 - `yes` — usable.
 - `no (missing file)` — no `imu_data.csv`; the sensor never connected.
+- `no (rate NN Hz<30)` — the effective sampling rate is below 30 Hz.
 - `no (dead baseline)` — the file exists and the sensor kept transmitting, but it
-  **stopped responding to movement**: acceleration sits at about 1 G and rotation near
-  0 dps for the whole session. That is what a sensor lying still reads, so the data is
+  **stopped responding to movement**: the acceleration peak is below 2 G or the rotation
+  peak is below 100 dps (a sensor lying still reads about 1 G and near 0 dps). That is what a sensor lying still reads, so the data is
   worthless even though it looks complete.
 - `no (loss NN%>50)` — more than half the data packets were lost over Bluetooth, so
   any timing-based measurement is too broken to trust.
 
-Treat every `no (...)` as **"this session has no IMU"**.
+The checks are applied in this order: missing file, rate, loss, dead baseline. Treat every `no (...)` as **"this session has no IMU"**.
 
 ### C2 — IMU transmission health
 
